@@ -1,0 +1,22 @@
+{
+  "appId": "local.planer.app",
+  "appName": "Pulse",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": false
+  },
+  "ios": {
+    "contentInset": "automatic"
+  },
+  "server": {
+    "androidScheme": "https"
+  },
+  "plugins": {
+    "LocalNotifications": {
+      "iconColor": "#0a4a5c"
+    },
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}

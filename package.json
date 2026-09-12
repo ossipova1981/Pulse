@@ -1,0 +1,67 @@
+{
+  "name": "planer",
+  "productName": "Pulse",
+  "version": "0.4.8",
+  "private": true,
+  "main": "electron/main.cjs",
+  "scripts": {
+    "desktop": "env -u ELECTRON_RUN_AS_NODE electron .",
+    "web": "npx --yes serve -p 4173 .",
+    "cap:sync": "node scripts/copy-www.cjs && npx cap sync",
+    "android": "node scripts/copy-www.cjs && npx cap sync android && npx cap open android",
+    "ios": "node scripts/copy-www.cjs && npx cap sync ios && npx cap open ios",
+    "desktop:build": "electron-builder --mac --win",
+    "desktop:mac": "electron-builder --mac",
+    "desktop:win": "electron-builder --win",
+    "android:apk": "node scripts/copy-www.cjs && npx cap sync android && cd android && ./gradlew assembleRelease"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^6.2.0",
+    "@capacitor/cli": "^6.2.0",
+    "@capacitor/core": "^6.2.0",
+    "@capacitor/ios": "^6.2.0",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "local.planer.app",
+    "productName": "Pulse",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "index.html",
+      "app.js",
+      "cloud.js",
+      "styles.css",
+      "manifest.webmanifest",
+      "sw.js",
+      "icons/**/*",
+      "electron/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "icons/icon-source.png",
+      "target": [
+        "zip"
+      ]
+    },
+    "win": {
+      "icon": "icons/icon-source.png",
+      "target": [
+        "zip",
+        "portable"
+      ]
+    },
+    "linux": {
+      "icon": "icons/icon-512.png",
+      "target": [
+        "AppImage"
+      ]
+    }
+  },
+  "dependencies": {
+    "@capacitor/app": "^6.0.3",
+    "@capacitor/local-notifications": "^6.1.3"
+  }
+}
