@@ -50,6 +50,8 @@ ipcMain.handle("webdav-request", async (_event, payload) => {
   return { status: response.status, body: await response.text() };
 });
 
+const windowIcon = path.join(__dirname, "../icons/desktop.ico");
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1320,
@@ -57,6 +59,7 @@ function createWindow() {
     minWidth: 960,
     minHeight: 640,
     title: "Pulse",
+    icon: windowIcon,
     backgroundColor: "#f3eee4",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -68,6 +71,8 @@ function createWindow() {
 
   win.loadFile(path.join(__dirname, "../index.html"));
 }
+
+app.setAppUserModelId("local.planer.app");
 
 app.whenReady().then(() => {
   createWindow();

@@ -13,6 +13,7 @@
   },
   "plugins": {
     "LocalNotifications": {
+      "smallIcon": "ic_stat_pulse",
       "iconColor": "#0a4a5c"
     },
     "CapacitorHttp": {

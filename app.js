@@ -1,5 +1,6 @@
 const STORAGE_KEY = "planer-local-v1";
-const PALETTE = ["#3d4a5c", "#c45c26", "#4a7c59", "#3d6b8a", "#8b3d55", "#b0892c", "#5c4f3a", "#6b4c7a"];
+const APP_VERSION = "0.4.76";
+const PALETTE = ["#7a8fa8", "#e07a3d", "#5fad78", "#4db0d4", "#d4658a", "#e0b040", "#c4a27a", "#a57bc4"];
 
 const DEFAULT_LEVELS = [
   { id: "level-work", name: "Работа", color: "#3d4a5c", visible: true, order: 0 },
@@ -10,7 +11,7 @@ const DEFAULT_LEVELS = [
 
 const LIFE_SPANS = [5, 10, 15, 20, 30, 40, 50, 70, 100];
 const GOAL_YEAR_PRESETS = [1, 3, 5, 10, 15, 20, 30, 50, 70, 100];
-const VIEWS = ["day", "week", "year", "span", "habit", "goals"];
+const VIEWS = ["day", "week", "year", "span", "habit", "goals", "lists", "search", "settings"];
 const YEAR_MONTH_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
 function uid() {
@@ -103,6 +104,7 @@ function emptyState() {
     habits: [],
     selectedHabitId: "",
     dailies: {},
+    showDaily: true,
     composing: null,
     editingId: null,
     levelDraftId: null,
@@ -112,6 +114,12 @@ function emptyState() {
     goals: [],
     selectedGoalId: "",
     goalYearsDraft: 5,
+    lists: [],
+    selectedListId: "",
+    listSearch: "",
+    entrySearch: "",
+    expandedListId: "",
+    timer: defaultTimer(),
     editorChecklist: [],
     editorDraft: null,
     sidebarOpen: false,
@@ -133,6 +141,68 @@ function daysInYear(year) {
 function filledHabitCount(habit, year) {
   const prefix = `${year}-`;
   return Object.entries(habit.cells || {}).filter(([date, value]) => date.startsWith(prefix) && String(value).trim()).length;
+}
+
+function filledHabitMonthCount(habit, year, month) {
+  const prefix = `${year}-${String(month + 1).padStart(2, "0")}-`;
+  return Object.entries(habit.cells || {}).filter(([date, value]) => date.startsWith(prefix) && String(value).trim()).length;
+}
+
+function habitCurrentStreak(habit) {
+  let cursor = new Date();
+  const today = toISODate(cursor);
+  if (!habitMarkedOn(habit, today)) {
+    cursor = addDays(cursor, -1);
+  }
+  let streak = 0;
+  for (let i = 0; i < 800; i += 1) {
+    const iso = toISODate(cursor);
+    if (!habitMarkedOn(habit, iso)) break;
+    streak += 1;
+    cursor = addDays(cursor, -1);
+  }
+  return streak;
+}
+
+function habitStats(habit, year) {
+  const now = new Date();
+  const month = now.getFullYear() === year ? now.getMonth() : 11;
+  const monthDone = filledHabitMonthCount(habit, year, month);
+  const monthDays = daysInMonth(year, month);
+  const yearDone = filledHabitCount(habit, year);
+  const yearDays = daysInYear(year);
+  const streak = habitCurrentStreak(habit);
+  const months = Array.from({ length: 12 }, (_, m) => ({
+    done: filledHabitMonthCount(habit, year, m),
+    days: daysInMonth(year, m),
+  }));
+  return { monthDone, monthDays, yearDone, yearDays, streak, months };
+}
+
+function horizonLabel(horizon) {
+  if (horizon === "day") return "День";
+  if (horizon === "week") return "Неделя";
+  if (horizon === "year") return "Год";
+  if (horizon === "span") return "Горизонт";
+  return horizon || "Запись";
+}
+
+function entrySearchText(entry) {
+  const checklist = normalizeChecklist(entry.checklist)
+    .map((item) => item.text)
+    .join(" ");
+  return [entry.title, entry.notes, checklist].filter(Boolean).join("\n").toLowerCase();
+}
+
+function searchPlannerEntries(query) {
+  const q = String(query || "")
+    .trim()
+    .toLowerCase();
+  if (!q) return [];
+  return [...(state.entries || [])]
+    .filter((entry) => entrySearchText(entry).includes(q))
+    .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")))
+    .slice(0, 100);
 }
 
 function normalizeHabits(habits) {
@@ -161,9 +231,28 @@ function normalizeHabits(habits) {
     return {
       id: habit.id || uid(),
       name: String(habit.name || "").trim() || "Привычка",
+      schedule: normalizeSchedule(habit.schedule),
+      bucket: normalizeBucket(habit.bucket),
+      remindAt: habit.remindAt ? normalizeRemindAt(habit.remindAt, habit.bucket || "day") : "",
       cells,
     };
   });
+}
+
+function migrateRoutinesIntoHabits(habits, routineTasks) {
+  const list = normalizeHabits(habits);
+  const tasks = normalizeRoutineTasks(routineTasks);
+  tasks.forEach((task) => {
+    const habit = list.find((item) => item.id === task.habitId);
+    if (!habit) return;
+    if (!habit.bucket) habit.bucket = normalizeBucket(task.bucket);
+    if (!habit.remindAt) {
+      habit.remindAt =
+        normalizeRemindAt(task.remindAt, task.bucket) || defaultRemindAt(task.bucket);
+    }
+    habit.schedule = normalizeSchedule(habit.schedule || "day");
+  });
+  return list;
 }
 
 function ensureWorkLevel(levels) {
@@ -173,6 +262,21 @@ function ensureWorkLevel(levels) {
     { id: "level-work", name: "Работа", color: "#3d4a5c", visible: true, order: 0 },
     ...levels,
   ];
+}
+
+function isCommitKey(event) {
+  return event.key === "Enter" || event.key === "Done" || event.key === "Go" || event.keyCode === 13;
+}
+
+function addLevel(name) {
+  const text = String(name || "").trim();
+  if (!text) return false;
+  const used = new Set(state.levels.map((level) => level.color));
+  const color = PALETTE.find((item) => !used.has(item)) || PALETTE[state.levels.length % PALETTE.length];
+  const level = { id: uid(), name: text, color, visible: true, order: state.levels.length };
+  state.levels.push(level);
+  state.lastLevelId = level.id;
+  return true;
 }
 
 function loadState() {
@@ -189,14 +293,18 @@ function loadState() {
       spanYears: LIFE_SPANS.includes(parsed.spanYears) ? parsed.spanYears : 10,
       cursor: parsed.cursor ?? fallback.cursor,
       lastLevelId: parsed.lastLevelId ?? fallback.lastLevelId,
-      habits: normalizeHabits(parsed.habits),
+      habits: migrateRoutinesIntoHabits(parsed.habits, parsed.routineTasks),
       selectedHabitId: parsed.selectedHabitId ?? "",
       dailies: parsed.dailies && typeof parsed.dailies === "object" ? parsed.dailies : {},
-      routineTasks: normalizeRoutineTasks(parsed.routineTasks),
+      showDaily: parsed.showDaily !== false,
+      routineTasks: [],
       theme: isThemeId(parsed.theme) ? parsed.theme : fallback.theme,
       goals: normalizeGoals(parsed.goals),
       selectedGoalId: parsed.selectedGoalId ?? "",
       goalYearsDraft: Math.min(120, Math.max(1, Number(parsed.goalYearsDraft) || 5)),
+      lists: normalizeLists(parsed.lists),
+      selectedListId: parsed.selectedListId ?? "",
+      timer: normalizeTimer(parsed.timer),
       updatedAt: Number(parsed.updatedAt) || 0,
     };
   } catch {
@@ -216,11 +324,15 @@ function snapshotPlanner(current) {
     habits: current.habits,
     selectedHabitId: current.selectedHabitId,
     dailies: current.dailies,
+    showDaily: current.showDaily !== false,
     routineTasks: current.routineTasks,
     theme: current.theme,
     goals: current.goals,
     selectedGoalId: current.selectedGoalId,
     goalYearsDraft: current.goalYearsDraft,
+    lists: current.lists,
+    selectedListId: current.selectedListId,
+    timer: snapshotTimer(current.timer),
     updatedAt: Number(current.updatedAt) || 0,
   };
 }
@@ -233,6 +345,9 @@ function plannerFingerprint(current) {
     dailies: current.dailies,
     routineTasks: current.routineTasks,
     goals: current.goals,
+    lists: current.lists,
+    theme: current.theme,
+    showDaily: current.showDaily !== false,
   });
 }
 
@@ -244,18 +359,26 @@ function applyPlannerSnapshot(parsed, { bumpTime = false } = {}) {
   state.spanYears = LIFE_SPANS.includes(parsed.spanYears) ? parsed.spanYears : state.spanYears;
   state.cursor = parsed.cursor || state.cursor;
   state.lastLevelId = parsed.lastLevelId || state.levels[0]?.id || "";
-  state.habits = normalizeHabits(parsed.habits);
+  state.habits = migrateRoutinesIntoHabits(parsed.habits, parsed.routineTasks);
   state.selectedHabitId = parsed.selectedHabitId || "";
   state.dailies = parsed.dailies && typeof parsed.dailies === "object" ? parsed.dailies : {};
-  state.routineTasks = normalizeRoutineTasks(parsed.routineTasks);
+  state.showDaily = parsed.showDaily !== false;
+  state.routineTasks = [];
   state.goals = normalizeGoals(parsed.goals);
   state.selectedGoalId = parsed.selectedGoalId || "";
   state.goalYearsDraft = Math.min(120, Math.max(1, Number(parsed.goalYearsDraft) || state.goalYearsDraft || 5));
+  state.lists = normalizeLists(parsed.lists);
+  state.selectedListId = parsed.selectedListId || "";
+  state.timer = normalizeTimer(parsed.timer);
   state.theme = isThemeId(parsed.theme) ? parsed.theme : state.theme;
   state.updatedAt = bumpTime ? Date.now() : Number(parsed.updatedAt) || Date.now();
   applyTheme(state.theme);
   return true;
 }
+
+let phoneCopyReady = !window.Capacitor?.isNativePlatform?.();
+let phoneCopyTimer = 0;
+let todayWidgetTimer = 0;
 
 function persist(state) {
   try {
@@ -266,8 +389,252 @@ function persist(state) {
     }
     lastDataFingerprint = fingerprint;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshotPlanner(state)));
+    if (phoneCopyReady) schedulePhoneCopy();
+    scheduleTodayWidget();
+    scheduleRemindSync();
   } catch (err) {
     console.warn("Не удалось сохранить данные", err);
+  }
+}
+
+function capacitorPlatform() {
+  const cap = window.Capacitor;
+  if (!cap) return "web";
+  try {
+    if (typeof cap.getPlatform === "function") {
+      const platform = String(cap.getPlatform() || "").toLowerCase();
+      if (platform) return platform;
+    }
+  } catch {
+    /* ignore */
+  }
+  return "web";
+}
+
+function isCapacitorNative() {
+  const cap = window.Capacitor;
+  if (!cap) return false;
+  try {
+    if (typeof cap.isNativePlatform === "function" && cap.isNativePlatform()) return true;
+  } catch {
+    /* ignore */
+  }
+  const platform = capacitorPlatform();
+  return platform === "android" || platform === "ios";
+}
+
+function phoneKeep() {
+  if (!isCapacitorNative()) return null;
+  const cap = window.Capacitor;
+  try {
+    if (typeof cap.registerPlugin === "function") {
+      return cap.registerPlugin("PulseKeep");
+    }
+    return cap.Plugins?.PulseKeep || null;
+  } catch {
+    return null;
+  }
+}
+
+function widgetBridgeHint() {
+  if (isCapacitorNative() && phoneKeep()) {
+    return "Связь с виджетом: есть (Android-приложение).";
+  }
+  if (capacitorPlatform() === "electron" || window.planerDesktop) {
+    return "Сейчас открыт компьютер — домашний виджет только на телефоне в приложении Pulse.";
+  }
+  return "Сейчас открыта веб-версия (браузер или ярлык сайта). Виджет обновится только если открыть Pulse из иконки приложения.";
+}
+
+function plannerWeight(data) {
+  if (!data || typeof data !== "object") return 0;
+  const entryItems = Array.isArray(data.entries)
+    ? data.entries.reduce((sum, entry) => sum + 1 + (Array.isArray(entry?.checklist) ? entry.checklist.length : 0), 0)
+    : 0;
+  return (
+    entryItems +
+    (Array.isArray(data.habits) ? data.habits.length : 0) +
+    (Array.isArray(data.lists) ? data.lists.length : 0) +
+    (Array.isArray(data.goals) ? data.goals.length : 0) +
+    (Array.isArray(data.routineTasks) ? data.routineTasks.length : 0)
+  );
+}
+
+function isSparsePlanner(data) {
+  return plannerWeight(data) === 0;
+}
+
+function schedulePhoneCopy() {
+  const keep = phoneKeep();
+  if (!keep?.save || plannerWeight(state) === 0) return;
+  clearTimeout(phoneCopyTimer);
+  phoneCopyTimer = setTimeout(() => {
+    const payload = buildTodayWidgetPayload();
+    keep.save({ text: payload.json }).catch(() => {});
+  }, 500);
+}
+
+function formatWidgetDate(date) {
+  try {
+    return new Intl.DateTimeFormat("ru-RU", { weekday: "short", day: "numeric", month: "short" }).format(date);
+  } catch {
+    return toISODate(date);
+  }
+}
+
+function normalizeEntryDate(value) {
+  const raw = String(value || "").trim();
+  return raw.length >= 10 ? raw.slice(0, 10) : raw;
+}
+
+function widgetEntryLines(entry) {
+  const lines = [];
+  const title = String(entry.title || "").trim();
+  const mark = entry.done ? "✓" : "•";
+  if (title) lines.push(`${mark} ${title}`);
+  normalizeChecklist(entry.checklist).forEach((item) => {
+    const text = String(item.text || "").trim();
+    if (!text) return;
+    lines.push(`${item.done ? "✓" : "•"} ${text}`);
+  });
+  return lines;
+}
+
+function buildTodayWidgetPayload() {
+  const now = new Date();
+  const today = toISODate(now);
+  const lines = [];
+  const buckets = [
+    ["allday", "Весь день"],
+    ["morning", "Утро"],
+    ["day", "День"],
+    ["evening", "Вечер"],
+  ];
+
+  const dayEntries = (state.entries || []).filter(
+    (entry) => (entry.horizon || "day") === "day" && normalizeEntryDate(entry.date) === today,
+  );
+
+  // Order like the Day screen: all-day → morning → day → evening.
+  // Skip empty buckets entirely.
+  buckets.forEach(([id, label]) => {
+    const items = dayEntries.filter((entry) => timeBucket(entry.startTime) === id);
+    if (!items.length) return;
+    if (lines.length >= 12) return;
+    lines.push(label);
+    items.forEach((entry) => {
+      widgetEntryLines(entry).forEach((line) => {
+        if (lines.length >= 12) return;
+        lines.push(line);
+      });
+    });
+  });
+
+  const habitLines = sortHabitsForDay(habitsBySchedule("day")).map((habit) => {
+    const done = habitMarkedOn(habit, today);
+    return `${done ? "✓" : "○"} ${habit.name}`;
+  });
+  if (habitLines.length && lines.length < 12) {
+    if (lines.length) lines.push("Привычки");
+    habitLines.forEach((line) => {
+      if (lines.length >= 12) return;
+      lines.push(line);
+    });
+  }
+
+  const subtitle = formatWidgetDate(now);
+  const text = lines.length ? lines.join("\n") : "Пока пусто — открой Pulse";
+  const theme = displayedTheme();
+  const snap = snapshotPlanner(state);
+  snap.theme = theme;
+  snap.widgetToday = { date: today, subtitle, lines: text, theme };
+  return {
+    subtitle,
+    lines: text,
+    theme,
+    json: JSON.stringify(snap),
+  };
+}
+
+function encodeWidgetLines(text) {
+  try {
+    return btoa(unescape(encodeURIComponent(String(text || ""))));
+  } catch {
+    return "";
+  }
+}
+
+async function pushTodayWidget({ toast = false } = {}) {
+  const keep = phoneKeep();
+  if (!keep?.updateToday && !keep?.save) {
+    return { ok: false, reason: "no-plugin", widgets: 0 };
+  }
+  const payload = buildTodayWidgetPayload();
+  let result = { widgets: 0, wrote: false, lines: payload.lines };
+  try {
+    // updateToday first (exact lines). save() only backs up JSON and must not rebuild the widget.
+    if (keep.updateToday) {
+      result = await keep.updateToday({
+        lines: payload.lines,
+        linesB64: encodeWidgetLines(payload.lines),
+        subtitle: payload.subtitle,
+        theme: payload.theme || displayedTheme(),
+        json: payload.json,
+        toast: !!toast,
+      });
+    }
+    if (keep.save) {
+      await keep.save({ text: payload.json });
+    }
+    return {
+      ok: true,
+      widgets: Number(result?.widgets || 0),
+      wrote: !!result?.wrote,
+      lines: String(result?.lines || payload.lines || ""),
+    };
+  } catch (err) {
+    console.warn("Не удалось обновить виджет", err);
+    return { ok: false, reason: "error", widgets: 0, error: err };
+  }
+}
+
+function scheduleTodayWidget() {
+  const keep = phoneKeep();
+  if (!keep?.updateToday && !keep?.save) return;
+  clearTimeout(todayWidgetTimer);
+  todayWidgetTimer = setTimeout(() => {
+    pushTodayWidget().then(() => {});
+  }, 300);
+}
+
+async function restorePhoneCopy() {
+  const keep = phoneKeep();
+  if (!keep?.load) {
+    phoneCopyReady = true;
+    return;
+  }
+  try {
+    const result = await keep.load();
+    const text = String(result?.text || "");
+    if (!text) return;
+    const parsed = JSON.parse(text);
+    if (!parsed || !Array.isArray(parsed.entries)) return;
+    const localW = plannerWeight(state);
+    const fileW = plannerWeight(parsed);
+    const localAt = Number(state.updatedAt) || 0;
+    const fileAt = Number(parsed.updatedAt) || 0;
+    // After reinstall localStorage is empty: always prefer a non-empty phone copy.
+    const shouldRestore =
+      fileW > 0 && (isSparsePlanner(state) || localW === 0 || fileW > localW || fileAt > localAt);
+    if (shouldRestore) {
+      applyPlannerSnapshot(parsed, { bumpTime: false });
+      lastDataFingerprint = plannerFingerprint(state);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshotPlanner(state)));
+    }
+  } catch (err) {
+    console.warn("Не удалось прочитать копию на телефоне", err);
+  } finally {
+    phoneCopyReady = true;
   }
 }
 
@@ -294,6 +661,62 @@ function normalizeGoals(goals) {
   });
 }
 
+function normalizeLists(lists) {
+  if (!Array.isArray(lists)) return [];
+  return lists.map((list) => ({
+    id: list.id || uid(),
+    name: String(list.name || "").trim() || "Список",
+    items: Array.isArray(list.items)
+      ? list.items
+          .map((item) => ({
+            id: item.id || uid(),
+            text: String(item.text || "").trim(),
+            done: Boolean(item.done),
+          }))
+          .filter((item) => item.text)
+      : [],
+  }));
+}
+
+function defaultTimer() {
+  return {
+    workMinutes: 25,
+    breakMinutes: 5,
+    phase: "idle",
+    endsAt: 0,
+    pausedMs: 0,
+    settingsOpen: false,
+    collapsed: false,
+  };
+}
+
+function normalizeTimer(timer) {
+  const base = defaultTimer();
+  if (!timer || typeof timer !== "object") return base;
+  const phase = timer.phase === "work" || timer.phase === "break" || timer.phase === "idle" ? timer.phase : "idle";
+  return {
+    workMinutes: Math.min(180, Math.max(1, Number(timer.workMinutes) || base.workMinutes)),
+    breakMinutes: Math.min(60, Math.max(1, Number(timer.breakMinutes) || base.breakMinutes)),
+    phase,
+    endsAt: phase === "idle" ? 0 : Math.max(0, Number(timer.endsAt) || 0),
+    pausedMs: phase === "idle" ? 0 : Math.max(0, Number(timer.pausedMs) || 0),
+    settingsOpen: false,
+    collapsed: Boolean(timer.collapsed),
+  };
+}
+
+function snapshotTimer(timer) {
+  const t = normalizeTimer(timer);
+  return {
+    workMinutes: t.workMinutes,
+    breakMinutes: t.breakMinutes,
+    phase: t.phase,
+    endsAt: t.endsAt,
+    pausedMs: t.pausedMs,
+    collapsed: t.collapsed,
+  };
+}
+
 function defaultRemindAt(bucket) {
   if (bucket === "morning") return "09:00";
   if (bucket === "day") return "13:00";
@@ -301,8 +724,13 @@ function defaultRemindAt(bucket) {
   return "09:00";
 }
 
+function normalizeBucket(value) {
+  return value === "morning" || value === "day" || value === "evening" ? value : "";
+}
+
 function normalizeRemindAt(value, bucket) {
   const raw = String(value || "").trim();
+  if (!raw) return "";
   if (/^\d{1,2}:\d{2}$/.test(raw)) {
     const [h, m] = raw.split(":").map(Number);
     if (h >= 0 && h <= 23 && m >= 0 && m <= 59) {
@@ -310,6 +738,40 @@ function normalizeRemindAt(value, bucket) {
     }
   }
   return defaultRemindAt(bucket);
+}
+
+function habitBucket(habit) {
+  return normalizeBucket(habit?.bucket);
+}
+
+function habitRemindAt(habit) {
+  const bucket = habitBucket(habit) || "day";
+  return normalizeRemindAt(habit?.remindAt, bucket);
+}
+
+function habitBucketLabel(bucket) {
+  if (bucket === "morning") return "Утро";
+  if (bucket === "day") return "День";
+  if (bucket === "evening") return "Вечер";
+  return "";
+}
+
+function habitBucketOrder(bucket) {
+  if (bucket === "morning") return 1;
+  if (bucket === "day") return 2;
+  if (bucket === "evening") return 3;
+  return 0;
+}
+
+function sortHabitsForDay(habits) {
+  return [...habits].sort((a, b) => {
+    const byBucket = habitBucketOrder(habitBucket(a)) - habitBucketOrder(habitBucket(b));
+    if (byBucket) return byBucket;
+    const timeA = habitRemindAt(a) || "99:99";
+    const timeB = habitRemindAt(b) || "99:99";
+    if (timeA !== timeB) return timeA.localeCompare(timeB);
+    return String(a.name || "").localeCompare(String(b.name || ""), "ru");
+  });
 }
 
 function normalizeRoutineTasks(tasks) {
@@ -332,6 +794,354 @@ function selectedGoal() {
   return (state.goals || []).find((goal) => goal.id === state.selectedGoalId);
 }
 
+function selectedList() {
+  return (state.lists || []).find((list) => list.id === state.selectedListId);
+}
+
+function ensureTimer() {
+  if (!state.timer) state.timer = defaultTimer();
+  return state.timer;
+}
+
+function timerPhaseLabel(phase) {
+  if (phase === "work") return "Работа";
+  if (phase === "break") return "Перерыв";
+  return "Фокус";
+}
+
+function timerRemainingMs(timer = ensureTimer()) {
+  if (timer.phase === "idle") return 0;
+  if (timer.pausedMs > 0 && !timer.endsAt) return timer.pausedMs;
+  if (!timer.endsAt) return 0;
+  return Math.max(0, timer.endsAt - Date.now());
+}
+
+function formatTimerClock(ms) {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function timerPhaseDurationMs(timer, phase = timer.phase) {
+  if (phase === "break") return timer.breakMinutes * 60 * 1000;
+  return timer.workMinutes * 60 * 1000;
+}
+
+const TIMER_ALARM_ID = 91;
+const TIMER_CHANNEL_START = "pulse-timer-start-v1";
+const TIMER_CHANNEL_DONE = "pulse-timer-done-v1";
+
+function playTimerChime(kind = "done") {
+  const start = kind === "start";
+  try {
+    navigator.vibrate?.(start ? [120, 80, 160] : [220, 120, 220, 120, 360]);
+  } catch {
+    /* ignore */
+  }
+
+  // Prefer the authored wav (same files Android notifications use).
+  try {
+    const src = start ? "sounds/pulse_focus_start.wav" : "sounds/pulse_focus_done.wav";
+    const audio = new Audio(src);
+    audio.volume = start ? 0.85 : 0.75;
+    const played = audio.play();
+    if (played && typeof played.catch === "function") {
+      played.catch(() => {
+        playTimerChimeSynth(start);
+      });
+      return;
+    }
+    return;
+  } catch {
+    /* fall through to synth */
+  }
+  playTimerChimeSynth(start);
+}
+
+function playTimerChimeSynth(start) {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const notes = start
+      ? [
+          [523.25, 0, 0.12],
+          [659.25, 0.16, 0.12],
+          [783.99, 0.32, 0.22],
+        ]
+      : [
+          [783.99, 0, 0.16],
+          [659.25, 0.2, 0.18],
+          [523.25, 0.42, 0.28],
+        ];
+    const master = ctx.createGain();
+    master.gain.value = start ? 0.22 : 0.18;
+    master.connect(ctx.destination);
+    notes.forEach(([freq, when, dur]) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = start ? "sine" : "triangle";
+      osc.frequency.value = freq;
+      gain.gain.value = 0.0001;
+      osc.connect(gain);
+      gain.connect(master);
+      const t0 = ctx.currentTime + when;
+      gain.gain.exponentialRampToValueAtTime(1, t0 + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.02);
+    });
+    setTimeout(() => {
+      try {
+        ctx.close();
+      } catch {
+        /* ignore */
+      }
+    }, 1200);
+  } catch {
+    /* ignore */
+  }
+}
+
+async function cancelTimerAlarm() {
+  const LocalNotifications = getLocalNotifications();
+  if (!LocalNotifications) return;
+  try {
+    await LocalNotifications.cancel({ notifications: [{ id: TIMER_ALARM_ID }] });
+  } catch {
+    /* ignore */
+  }
+}
+
+async function ensureTimerChannels(LocalNotifications) {
+  const specs = [
+    {
+      id: TIMER_CHANNEL_START,
+      name: "Фокус · старт работы",
+      description: "Сигнал начала рабочего интервала",
+      sound: "pulse_focus_start",
+    },
+    {
+      id: TIMER_CHANNEL_DONE,
+      name: "Фокус · конец работы",
+      description: "Сигнал окончания работы / начало перерыва",
+      sound: "pulse_focus_done",
+    },
+  ];
+  for (const spec of specs) {
+    try {
+      await LocalNotifications.createChannel({
+        id: spec.id,
+        name: spec.name,
+        description: spec.description,
+        importance: 5,
+        visibility: 1,
+        vibration: true,
+        lights: true,
+        lightColor: "#0a4a5c",
+        sound: spec.sound,
+      });
+    } catch {
+      /* channel may already exist */
+    }
+  }
+}
+
+async function scheduleTimerAlarm() {
+  const timer = ensureTimer();
+  await cancelTimerAlarm();
+  if (timer.phase === "idle" || !timer.endsAt || timer.pausedMs) return;
+
+  const LocalNotifications = getLocalNotifications();
+  if (!LocalNotifications) return;
+
+  try {
+    const access = await ensureReminderPermissions(LocalNotifications, { promptExact: false });
+    if (!access.ok) return;
+    await ensureTimerChannels(LocalNotifications);
+
+    const fireAt = Number(timer.endsAt);
+    if (!Number.isFinite(fireAt) || fireAt <= Date.now() + 700) return;
+
+    const endingWork = timer.phase === "work";
+    await LocalNotifications.schedule({
+      notifications: [
+        {
+          id: TIMER_ALARM_ID,
+          title: "Pulse · Фокус",
+          body: endingWork ? "Работа закончилась — время перерыва" : "Перерыв закончился — снова за работу",
+          largeBody: endingWork ? "Работа закончилась — время перерыва" : "Перерыв закончился — снова за работу",
+          channelId: endingWork ? TIMER_CHANNEL_DONE : TIMER_CHANNEL_START,
+          sound: endingWork ? "pulse_focus_done" : "pulse_focus_start",
+          smallIcon: "ic_stat_pulse",
+          iconColor: "#0a4a5c",
+          schedule: {
+            at: new Date(fireAt).toISOString(),
+            allowWhileIdle: true,
+          },
+          extra: { kind: "timer", phase: timer.phase, chime: endingWork ? "done" : "start" },
+        },
+      ],
+    });
+  } catch (err) {
+    console.warn("timer alarm", err);
+  }
+}
+
+function startTimerPhase(phase, { chime = false } = {}) {
+  const timer = ensureTimer();
+  timer.phase = phase;
+  timer.pausedMs = 0;
+  timer.endsAt = Date.now() + timerPhaseDurationMs(timer, phase);
+  timer.settingsOpen = false;
+  if (chime && phase === "work") playTimerChime("start");
+  if (chime && phase === "break") playTimerChime("done");
+  scheduleTimerAlarm();
+}
+
+function advanceTimerPhase() {
+  const timer = ensureTimer();
+  const next = timer.phase === "work" ? "break" : "work";
+  // End of work → soft “done”; end of break → bright “start work”.
+  playTimerChime(next === "break" ? "done" : "start");
+  startTimerPhase(next);
+  // Web-only fallback; on Android the LocalNotification already fired / is scheduled.
+  if (!isCapacitorNative()) {
+    try {
+      if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+        new Notification("Pulse", {
+          body: next === "break" ? "Перерыв — можно отдохнуть" : "Снова за работу",
+        });
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function paintTimerDisplay() {
+  const timer = ensureTimer();
+  const remaining = timerRemainingMs(timer);
+  if (timer.phase !== "idle" && timer.endsAt && remaining <= 0 && !timer.pausedMs) {
+    advanceTimerPhase();
+    render();
+    return;
+  }
+  const clock = root.querySelector("[data-role=timer-clock]");
+  const label = root.querySelector("[data-role=timer-label]");
+  const meta = root.querySelector("[data-role=timer-meta]");
+  if (clock) {
+    clock.textContent =
+      timer.phase === "idle"
+        ? formatTimerClock(timer.workMinutes * 60 * 1000)
+        : formatTimerClock(remaining);
+  }
+  if (label) label.textContent = timerPhaseLabel(timer.phase);
+  if (meta) {
+    meta.textContent =
+      timer.phase === "idle"
+        ? `${timer.workMinutes} мин · перерыв ${timer.breakMinutes} мин`
+        : timer.pausedMs && !timer.endsAt
+          ? "Пауза"
+          : timer.phase === "work"
+            ? `из ${timer.workMinutes} мин`
+            : `из ${timer.breakMinutes} мин`;
+  }
+  const widget = root.querySelector("[data-role=focus-timer]");
+  if (widget) {
+    widget.dataset.phase = timer.phase;
+    widget.classList.toggle("running", timer.phase !== "idle" && timer.endsAt > 0);
+    widget.classList.toggle("paused", timer.phase !== "idle" && timer.pausedMs > 0 && !timer.endsAt);
+  }
+}
+
+function renderFocusTimer() {
+  const timer = ensureTimer();
+  const remaining = timerRemainingMs(timer);
+  const clock =
+    timer.phase === "idle"
+      ? formatTimerClock(timer.workMinutes * 60 * 1000)
+      : formatTimerClock(remaining);
+  const running = timer.phase !== "idle" && timer.endsAt > 0;
+  const paused = timer.phase !== "idle" && timer.pausedMs > 0 && !timer.endsAt;
+
+  if (timer.collapsed) {
+    return `
+      <button
+        type="button"
+        class="focus-timer-chip${running ? " running" : ""}${paused ? " paused" : ""}"
+        data-action="timer-expand"
+        data-phase="${timer.phase}"
+        title="Показать фокус"
+        aria-label="Показать фокус"
+      >
+        <span>${timerPhaseLabel(timer.phase)}</span>
+        <strong data-role="timer-clock">${clock}</strong>
+      </button>
+    `;
+  }
+
+  return `
+    <aside
+      class="focus-timer${running ? " running" : ""}${paused ? " paused" : ""}${timer.settingsOpen ? " settings-open" : ""}"
+      data-role="focus-timer"
+      data-phase="${timer.phase}"
+    >
+      <div class="focus-timer-head">
+        <div class="focus-timer-main">
+          <div class="focus-timer-label" data-role="timer-label">${timerPhaseLabel(timer.phase)}</div>
+          <div class="focus-timer-clock" data-role="timer-clock">${clock}</div>
+          <div class="focus-timer-meta" data-role="timer-meta">
+            ${
+              timer.phase === "idle"
+                ? `${timer.workMinutes} мин · перерыв ${timer.breakMinutes} мин`
+                : paused
+                  ? "Пауза"
+                  : timer.phase === "work"
+                    ? `из ${timer.workMinutes} мин`
+                    : `из ${timer.breakMinutes} мин`
+            }
+          </div>
+        </div>
+        <button type="button" class="ghost focus-timer-hide" data-action="timer-collapse" title="Скрыть" aria-label="Скрыть фокус">✕</button>
+      </div>
+      <div class="focus-timer-actions">
+        ${
+          timer.phase === "idle"
+            ? `<button type="button" class="solid" data-action="timer-start">Старт</button>`
+            : paused
+              ? `<button type="button" class="solid" data-action="timer-resume">Продолжить</button>`
+              : `<button type="button" class="ghost" data-action="timer-pause">Пауза</button>`
+        }
+        ${
+          timer.phase === "idle"
+            ? ""
+            : `<button type="button" class="ghost" data-action="timer-skip">Дальше</button>
+               <button type="button" class="ghost" data-action="timer-reset">Сброс</button>`
+        }
+        <button type="button" class="ghost" data-action="timer-toggle-settings" title="Настроить">⚙</button>
+      </div>
+      ${
+        timer.settingsOpen
+          ? `
+        <div class="focus-timer-settings">
+          <label class="field">
+            <span>Работа, мин</span>
+            <input type="number" min="1" max="180" data-role="timer-work" value="${timer.workMinutes}" />
+          </label>
+          <label class="field">
+            <span>Перерыв, мин</span>
+            <input type="number" min="1" max="60" data-role="timer-break" value="${timer.breakMinutes}" />
+          </label>
+          <p class="focus-timer-hint">Например 25 / 5 — классический помидор</p>
+        </div>`
+          : ""
+      }
+    </aside>
+  `;
+}
+
 const THEMES = {
   classic: {
     "--paper": "#f3eee4",
@@ -343,6 +1153,7 @@ const THEMES = {
     "--weekend": "#efe8db",
     "--danger": "#8b3d3d",
     "--focus": "#9a4a2a",
+    "--check": "#9a4a2a",
   },
   dark: {
     "--paper": "#121212",
@@ -354,6 +1165,7 @@ const THEMES = {
     "--weekend": "#181818",
     "--danger": "#c06060",
     "--focus": "#8a8a8a",
+    "--check": "#ececec",
   },
   swamp: {
     "--paper": "#163128",
@@ -365,17 +1177,19 @@ const THEMES = {
     "--weekend": "#2a523f",
     "--danger": "#d16b4a",
     "--focus": "#e2b35a",
+    "--check": "#e2b35a",
   },
   turquoise: {
-    "--paper": "#0a4866",
-    "--paper-2": "#0e5678",
-    "--ink": "#f0fffb",
-    "--muted": "#c5e8ef",
-    "--line": "#2a7690",
-    "--today": "#3a96b4",
-    "--weekend": "#1a5a78",
-    "--danger": "#b85a5a",
-    "--focus": "#5bb4d0",
+    "--paper": "#0d7ab8",
+    "--paper-2": "#1488c8",
+    "--ink": "#ffffff",
+    "--muted": "#e8f7ff",
+    "--line": "#5ebce6",
+    "--today": "#4eb8e4",
+    "--weekend": "#1c6fa8",
+    "--danger": "#ff8585",
+    "--focus": "#7ed4f4",
+    "--check": "#ffffff",
   },
   orange: {
     "--paper": "#3a1f0c",
@@ -387,6 +1201,7 @@ const THEMES = {
     "--weekend": "#6f3d1d",
     "--danger": "#b85a5a",
     "--focus": "#f0a23f",
+    "--check": "#f0a23f",
   },
   candy: {
     "--paper": "#f6eef8",
@@ -398,6 +1213,7 @@ const THEMES = {
     "--weekend": "#c8e6f8",
     "--danger": "#d4788e",
     "--focus": "#d8a0e8",
+    "--check": "#8a4a9a",
   },
   citrus: {
     "--paper": "#ffb84d",
@@ -409,13 +1225,142 @@ const THEMES = {
     "--weekend": "#ff8c2a",
     "--danger": "#b01010",
     "--focus": "#000000",
+    "--check": "#000000",
+  },
+  winter: {
+    "--paper": "#d5e2ec",
+    "--paper-2": "#c3d4e2",
+    "--ink": "#1e3344",
+    "--muted": "#5a7388",
+    "--line": "#9bb4c6",
+    "--today": "#b8d4c0",
+    "--weekend": "#c8d8e6",
+    "--danger": "#a85a5a",
+    "--focus": "#3d6b58",
+    "--check": "#2f5d4a",
+  },
+  noel: {
+    "--paper": "#b01018",
+    "--paper-2": "#9a0e14",
+    "--ink": "#fff8f0",
+    "--muted": "#f0d8c8",
+    "--line": "#2a7a3a",
+    "--today": "#1f6b3a",
+    "--weekend": "#8a0c12",
+    "--danger": "#ffe08a",
+    "--focus": "#f0d070",
+    "--check": "#f0d070",
+  },
+  golden: {
+    "--paper": "#d4a84a",
+    "--paper-2": "#c89838",
+    "--ink": "#2a1a08",
+    "--muted": "#5a3a18",
+    "--line": "#8a6018",
+    "--today": "#e8c86a",
+    "--weekend": "#b88828",
+    "--danger": "#a03020",
+    "--focus": "#3a2410",
+    "--check": "#2a1a08",
   },
 };
 
-const THEME_IDS = ["classic", "dark", "swamp", "turquoise", "orange", "candy", "citrus"];
+const THEME_IDS = [
+  "classic",
+  "dark",
+  "swamp",
+  "turquoise",
+  "orange",
+  "candy",
+  "citrus",
+  "winter",
+  "noel",
+  "golden",
+];
 
 function isThemeId(value) {
   return THEME_IDS.includes(value);
+}
+
+const FREE_THEMES = [
+  "classic",
+  "dark",
+  "turquoise",
+  "swamp",
+  "orange",
+  "citrus",
+  "candy",
+  "winter",
+  "noel",
+  "golden",
+];
+const THEME_CHOICES = [
+  ["classic", "Классика"],
+  ["dark", "Тёмная"],
+  ["turquoise", "Бирюзовый"],
+  ["swamp", "Болотный"],
+  ["orange", "Кожаный"],
+  ["citrus", "Сочный"],
+  ["candy", "Рассвет на море"],
+  ["winter", "Зимний туман"],
+  ["noel", "Новогодняя"],
+  ["golden", "Золотая коза"],
+];
+const PLUS_KEY = "planer-plus-v1";
+const PLUS_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const PLUS_SECRET = "pulse-plus-2026";
+
+function readPlus() {
+  try {
+    return localStorage.getItem(PLUS_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function hasPlus() {
+  return state.plus === true;
+}
+
+function themeIsFree(themeName) {
+  return FREE_THEMES.includes(themeName);
+}
+
+function displayedTheme() {
+  if (isThemeId(state.theme) && (themeIsFree(state.theme) || hasPlus())) return state.theme;
+  return "turquoise";
+}
+
+function plusDigest(payload) {
+  let hash = 2166136261;
+  const text = `${PLUS_SECRET}:${payload}`;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function plusChecksum(payload) {
+  let n = plusDigest(payload);
+  let out = "";
+  for (let i = 0; i < 4; i += 1) {
+    out += PLUS_ALPHABET[n % PLUS_ALPHABET.length];
+    n = Math.floor(n / PLUS_ALPHABET.length);
+  }
+  return out;
+}
+
+function isPlusCode(value) {
+  const code = String(value || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  if (code.length !== 8) return false;
+  const payload = code.slice(0, 4);
+  const check = code.slice(4);
+  const chars = [...payload, ...check];
+  if (chars.some((ch) => !PLUS_ALPHABET.includes(ch))) return false;
+  return plusChecksum(payload) === check;
 }
 
 function applyTheme(themeName) {
@@ -425,10 +1370,11 @@ function applyTheme(themeName) {
 }
 
 const state = loadState();
+state.plus = readPlus();
 const root = document.getElementById("app");
 let cloudApplying = false;
 let lastDataFingerprint = plannerFingerprint(state);
-applyTheme(state.theme);
+applyTheme(displayedTheme());
 
 function visibleLevels() {
   return state.levels.filter((level) => level.visible);
@@ -553,40 +1499,140 @@ function chip(entry, showTime) {
   `;
 }
 
-const ROUTINE_BUCKETS = [
-  ["morning", "Утро", "09:00"],
-  ["day", "День", "13:00"],
-  ["evening", "Вечер", "19:00"],
-];
-
-function routineBucketMeta(bucket) {
-  return ROUTINE_BUCKETS.find((item) => item[0] === bucket) || [bucket, "Задача", ""];
-}
-
 function habitMarkDisplay(value) {
   const v = String(value || "").trim();
   if (!v) return "";
-  if (v === "1" || /^[xX✓✔]$/.test(v)) return "✓";
-  return v.slice(0, 2);
+  if (/^[xX✓✔]$/.test(v)) return "✓";
+  if (/^\d{1,3}$/.test(v)) {
+    const n = Number(v);
+    if (n >= 1 && n <= 100) return String(n);
+    if (n > 100) return "100";
+    return "";
+  }
+  return v.slice(0, 3);
 }
 
-function routineChip(task, iso, showTime) {
-  const habit = state.habits.find((h) => h.id === task.habitId);
-  if (!habit) return "";
-  const done = Boolean(String(habit.cells?.[iso] || "").trim());
-  const level = levelById(task.levelId);
-  const color = level?.color || "#7a7166";
-  const [, bucketLabel, time] = routineBucketMeta(task.bucket);
-  const remindAt = normalizeRemindAt(task.remindAt, task.bucket);
-  const meta = [showTime && (remindAt || time), bucketLabel, level?.name].filter(Boolean).join(" · ");
+function normalizeHabitCellValue(raw) {
+  const v = String(raw || "").trim().slice(0, 3);
+  if (!v) return "";
+  if (/^[xX✓✔]$/.test(v)) return "✓";
+  if (/^\d+$/.test(v)) {
+    const n = Number(v);
+    if (n >= 1 && n <= 100) return String(n);
+    if (n > 100) return "100";
+    return "";
+  }
+  return v;
+}
+
+const HABIT_SCHEDULES = [
+  ["day", "Каждый день", "день"],
+  ["week", "Раз в неделю", "неделя"],
+  ["month", "Раз в месяц", "месяц"],
+];
+
+function normalizeSchedule(value) {
+  return value === "week" || value === "month" ? value : "day";
+}
+
+function habitSchedule(habit) {
+  return normalizeSchedule(habit?.schedule);
+}
+
+function habitScheduleLabel(schedule, short) {
+  const row = HABIT_SCHEDULES.find((item) => item[0] === schedule) || HABIT_SCHEDULES[0];
+  return short ? row[2] : row[1];
+}
+
+function habitsBySchedule(schedule) {
+  return (state.habits || []).filter((habit) => habitSchedule(habit) === schedule);
+}
+
+function habitMarkedOn(habit, iso) {
+  return Boolean(String(habit?.cells?.[iso] || "").trim());
+}
+
+function datesInWeek(mondayIso) {
+  const start = parseISODate(mondayIso);
+  return Array.from({ length: 7 }, (_, index) => toISODate(addDays(start, index)));
+}
+
+function monthDateList(year, month) {
+  const max = daysInMonth(year, month);
+  const mm = String(month + 1).padStart(2, "0");
+  return Array.from({ length: max }, (_, index) => `${year}-${mm}-${String(index + 1).padStart(2, "0")}`);
+}
+
+function habitMarkedIn(habit, dates) {
+  return dates.some((iso) => habitMarkedOn(habit, iso));
+}
+
+function clearHabitMarks(habit, dates) {
+  if (!habit.cells) habit.cells = {};
+  dates.forEach((iso) => {
+    delete habit.cells[iso];
+  });
+}
+
+function habitScheduleButtons(current, action, id) {
+  return HABIT_SCHEDULES.map(
+    ([value, label]) => `
+      <button
+        type="button"
+        class="habit-schedule-btn${current === value ? " active" : ""}"
+        data-action="${action}"
+        ${id ? `data-id="${id}"` : ""}
+        data-schedule="${value}"
+      >${label}</button>`,
+  ).join("");
+}
+
+const HABIT_BUCKETS = [
+  ["", "Без корзины"],
+  ["morning", "Утро"],
+  ["day", "День"],
+  ["evening", "Вечер"],
+];
+
+function habitBucketButtons(current, action, id) {
+  return HABIT_BUCKETS.map(
+    ([value, label]) => `
+      <button
+        type="button"
+        class="habit-schedule-btn${current === value ? " active" : ""}"
+        data-action="${action}"
+        ${id ? `data-id="${id}"` : ""}
+        data-bucket="${value}"
+      >${label}</button>`,
+  ).join("");
+}
+
+function habitMetaLine(habit) {
+  const parts = [
+    habitScheduleLabel(habitSchedule(habit)),
+    habitBucketLabel(habitBucket(habit)),
+    habitRemindAt(habit) ? `⌚ ${habitRemindAt(habit)}` : "",
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
+function habitCheckChip(habit, options) {
+  const done = options.done;
   return `
-    <div class="chip routine-chip${done ? " done" : ""}">
-      <span class="chip-bar" style="background:${color}"></span>
+    <div class="chip routine-chip habit-chip${done ? " done" : ""}">
+      <span class="chip-bar" style="background:#2f6f73"></span>
       <span class="chip-body">
         <div class="chip-title">${escapeHtml(habit.name)}</div>
         <div class="chip-meta-row">
-          <div class="chip-meta">${escapeHtml(meta)}</div>
-          <label class="chip-toggle${done ? " active" : ""}" data-action="toggle-routine-task" data-task-id="${task.id}" data-date="${iso}">
+          <div class="chip-meta">${escapeHtml(habitMetaLine(habit))}</div>
+          <label
+            class="chip-toggle${done ? " active" : ""}"
+            data-action="toggle-habit-mark"
+            data-id="${habit.id}"
+            data-scope="${options.scope}"
+            data-anchor="${options.anchor}"
+            data-mark="${options.mark}"
+          >
             <input type="checkbox" ${done ? "checked" : ""} />
             <span>сделано</span>
           </label>
@@ -596,40 +1642,88 @@ function routineChip(task, iso, showTime) {
   `;
 }
 
-function routineChipsForDay(iso, bucket) {
-  return state.routineTasks
-    .filter((task) => (bucket ? task.bucket === bucket : true))
-    .map((task) => routineChip(task, iso, true))
-    .join("");
+function habitControls(habit) {
+  const bucket = habitBucket(habit);
+  const remind = habitRemindAt(habit);
+  return `
+    <div class="habit-controls">
+      <div class="habit-schedule-row">
+        ${habitScheduleButtons(habitSchedule(habit), "set-habit-schedule", habit.id)}
+      </div>
+      <div class="habit-schedule-row">
+        ${habitBucketButtons(bucket, "set-habit-bucket", habit.id)}
+      </div>
+      <div class="habit-remind-row">
+        <span>Напоминание</span>
+        <div class="habit-remind-actions">
+          <input
+            class="habit-remind"
+            type="text"
+            inputmode="numeric"
+            placeholder="нет"
+            maxlength="5"
+            data-role="habit-remind"
+            data-id="${habit.id}"
+            value="${escapeHtml(remind)}"
+            title="Время в формате 09:00"
+          />
+          ${
+            remind
+              ? `<button type="button" class="ghost habit-remind-clear" data-action="clear-habit-remind" data-id="${habit.id}">Убрать</button>`
+              : ""
+          }
+        </div>
+      </div>
+    </div>
+  `;
 }
 
-function renderDayRoutinesPanel(iso, options = {}) {
-  const tasks = state.routineTasks.filter((task) => state.habits.some((h) => h.id === task.habitId));
-  if (!tasks.length) return "";
-  const open = Boolean(state.dayRoutinesOpenByDate?.[iso]);
-  const done = tasks.filter((task) => {
-    const habit = state.habits.find((h) => h.id === task.habitId);
-    return Boolean(String(habit?.cells?.[iso] || "").trim());
-  }).length;
-  const compact = options.compact ? " compact" : "";
+function renderHabitChecks(title, habits, optionsFor) {
+  if (!habits.length) return "";
+  const done = habits.filter((habit) => optionsFor(habit).done).length;
   return `
-    <section class="day-routines${open ? " open" : ""}${compact}">
-      <button
-        type="button"
-        class="day-routines-toggle"
-        data-action="toggle-day-routines"
-        data-date="${iso}"
-        aria-expanded="${open ? "true" : "false"}"
-      >
-        <span>Ежедневные задачи</span>
-        <span class="day-routines-meta">${done}/${tasks.length}${open ? " ▾" : " ▸"}</span>
-      </button>
-      <div class="day-routines-body" data-open="${open ? "true" : "false"}">
-        ${tasks.map((task) => routineChip(task, iso, !options.compact)).join("")}
+    <section class="day-routines open habit-checks">
+      <div class="day-routines-toggle static">
+        <span>${escapeHtml(title)}</span>
+        <span class="day-routines-meta">${done}/${habits.length}</span>
+      </div>
+      <div class="day-routines-body" data-open="true">
+        ${habits.map((habit) => habitCheckChip(habit, optionsFor(habit))).join("")}
       </div>
     </section>
   `;
 }
+
+function renderMonthHabitChecks(year, month) {
+  const habits = habitsBySchedule("month");
+  if (!habits.length) return "";
+  const dates = monthDateList(year, month);
+  const today = toISODate(new Date());
+  const mark = dates.includes(today) ? today : dates[0];
+  const anchor = dates[0];
+  return `
+    <div class="month-habits">
+      ${habits
+        .map((habit) => {
+          const done = habitMarkedIn(habit, dates);
+          return `
+            <label
+              class="month-habit${done ? " done" : ""}"
+              data-action="toggle-habit-mark"
+              data-id="${habit.id}"
+              data-scope="month"
+              data-anchor="${anchor}"
+              data-mark="${mark}"
+            >
+              <input type="checkbox" ${done ? "checked" : ""} />
+              <span>${escapeHtml(habit.name)}</span>
+            </label>`;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
 
 function dayPlanCount(iso) {
   return visibleEntries().filter((entry) => entry.horizon === "day" && entry.date === iso).length;
@@ -676,12 +1770,29 @@ function quoteOfTheDay(date = new Date()) {
   return DAILY_QUOTES[dayOfYear % DAILY_QUOTES.length];
 }
 
+function renderPlusSettings() {
+  if (hasPlus()) {
+    return `<p class="hint">Pulse Plus включён на этом устройстве: облако и копии.</p>`;
+  }
+  return `
+          <p class="hint">Планировщик бесплатный. Все цвета уже открыты. Один код открывает на этом устройстве синхронизацию и копии.</p>
+          <input class="add-level" data-role="plus-code" enterkeyhint="done" placeholder="Код Pulse Plus" autocomplete="off" />
+          <p class="cloud-status" data-role="plus-status"></p>
+          <button type="button" class="ghost" data-action="unlock-plus">Открыть</button>
+  `;
+}
+
 function renderCloudSettings() {
+  if (!hasPlus()) {
+    return `
+          <p class="hint">Синхронизация между телефоном и компьютером входит в Pulse Plus.</p>
+          <button type="button" class="ghost" data-action="open-plus">Что входит в Plus</button>
+    `;
+  }
   const meta = window.PulseCloud?.loadMeta?.() || { enabled: false, email: "", lastError: "" };
   const nativeOk = window.PulseCloud?.isNativeApp?.();
   const status = window.PulseCloud?.formatStatus?.(meta) || "";
   return `
-        <div class="theme-settings" data-role="cloud-settings" data-open="false">
           <p class="cloud-help">
             Нужен <a href="https://id.mail.ru/security" target="_blank" rel="noopener">пароль внешнего приложения</a>
             с доступом к Облаку (WebDAV), не обычный пароль почты.
@@ -694,12 +1805,104 @@ function renderCloudSettings() {
             <input type="checkbox" data-role="cloud-enabled" ${meta.enabled ? "checked" : ""} />
             Синхронизировать это устройство
           </label>
+          <label class="cloud-enable">
+            <input type="checkbox" data-role="cloud-auto-30" ${meta.autoEvery30 ? "checked" : ""} ${meta.enabled ? "" : "disabled"} />
+            Автосинхронизация каждые 30 минут
+          </label>
           <p class="cloud-status" data-role="cloud-status">${escapeHtml(status)}</p>
-          <div class="file-row" style="margin-top:8px">
+          <div class="file-row">
             <button type="button" class="ghost" data-action="cloud-save">Сохранить</button>
             <button type="button" class="ghost" data-action="cloud-sync-now">Синхронизировать</button>
           </div>
+  `;
+}
+
+function renderSettingsNav() {
+  return `
+    <div class="lists-block">
+      <button
+        type="button"
+        class="routine-toggle${state.view === "settings" ? " open" : ""}"
+        data-action="open-settings"
+      >
+        <span>Настройки</span>
+        <span class="routine-toggle-meta">${state.view === "settings" ? "▾" : "▸"}</span>
+      </button>
+    </div>
+  `;
+}
+
+function renderSettingsBoard() {
+  return `
+    <section class="lists-page settings-page">
+      <div class="goals-panel open-always lists-create">
+        <div class="banner-title">Настройки</div>
+        <p class="hint" style="margin:0">Записи живут на устройстве. Синхронизация и копии открываются в Pulse Plus.</p>
+      </div>
+
+      <section class="settings-section" data-role="settings-day">
+        <h3 class="settings-section-title">День</h3>
+        <label class="daily-toggle" data-action="toggle-daily">
+          <input type="checkbox" ${state.showDaily === false ? "" : "checked"} />
+          Показывать дейли
+        </label>
+        <p class="hint">Можно убрать, когда не работаете.</p>
+        <p class="hint">На телефоне: виджет «Сегодня» на рабочий стол и напоминания привычек (время у привычки). Разрешите уведомления Pulse.</p>
+      </section>
+
+      <section class="settings-section" data-role="settings-theme">
+        <h3 class="settings-section-title">Цвет</h3>
+        <div class="theme-settings-row">
+          ${THEME_CHOICES.map(([id, label]) => {
+            const paid = !themeIsFree(id);
+            const locked = paid && !hasPlus();
+            const active = displayedTheme() === id;
+            return `<button type="button" class="${active ? "solid" : "ghost"}${locked ? " theme-locked" : ""}" data-action="set-theme" data-theme="${id}">${label}${locked ? " · Plus" : ""}</button>`;
+          }).join("")}
         </div>
+      </section>
+
+      <section class="settings-section" data-role="settings-data">
+        <h3 class="settings-section-title">Копии</h3>
+        <p class="hint">Экспорт и импорт файла planer.json. На телефоне копия лежит в Загрузки → Pulse → planer.json и должна вернуться после переустановки.</p>
+        <div class="file-row">
+          <button type="button" class="ghost" data-action="export">Экспорт</button>
+          <button type="button" class="ghost" data-action="import">Импорт</button>
+          <button type="button" class="ghost" data-action="restore-phone-copy">Вернуть с телефона</button>
+        </div>
+        <input type="file" accept="application/json,.json" data-role="import-file" hidden />
+      </section>
+
+      <section class="settings-section" data-role="settings-cloud">
+        <h3 class="settings-section-title">Облако Mail.ru</h3>
+        ${renderCloudSettings()}
+      </section>
+
+      <section class="settings-section" data-role="settings-plus" id="settings-plus">
+        <h3 class="settings-section-title">${hasPlus() ? "Pulse Plus включён" : "Pulse Plus"}</h3>
+        ${renderPlusSettings()}
+      </section>
+
+      <section class="settings-section" data-role="settings-reminders">
+        <h3 class="settings-section-title">Уведомления</h3>
+        <p class="hint">${escapeHtml(state.remindStatus || "Проверяю…")}</p>
+        <p class="hint">Напоминания: ${habitsWithReminders().length}</p>
+        <div class="file-row">
+          <button type="button" class="ghost" data-action="enable-reminders">Включить</button>
+          <button type="button" class="ghost" data-action="test-reminder">Тест сейчас</button>
+        </div>
+      </section>
+
+      <section class="settings-section" data-role="settings-about">
+        <h3 class="settings-section-title">О приложении</h3>
+        <p class="hint">Pulse ${escapeHtml(APP_VERSION)}</p>
+        <p class="hint">${escapeHtml(widgetBridgeHint())}</p>
+        <p class="hint">Что уйдёт в виджет «Сегодня»:</p>
+        <pre class="widget-preview">${escapeHtml(buildTodayWidgetPayload().lines)}</pre>
+        <button type="button" class="ghost" data-action="refresh-today-widget">Обновить виджет</button>
+        <p class="hint" data-role="widget-push-status">${escapeHtml(state.widgetPushStatus || "")}</p>
+      </section>
+    </section>
   `;
 }
 
@@ -713,7 +1916,7 @@ function renderSidebar() {
             <div class="palette">
               ${PALETTE.map(
                 (color) =>
-                  `<button type="button" class="${color === level.color ? "selected" : ""}" style="background:${color}" data-action="level-color" data-id="${level.id}" data-color="${color}"></button>`,
+                  `<button type="button" class="palette-swatch${color === level.color ? " selected" : ""}" data-action="level-color" data-id="${level.id}" data-color="${color}" aria-label="Цвет ${color}" title="${color}"><span class="palette-dot" style="background:${color};background-color:${color}"></span></button>`,
               ).join("")}
             </div>
             <div class="file-row">
@@ -746,15 +1949,18 @@ function renderSidebar() {
           <button type="button" class="icon-btn sidebar-close" data-action="close-sidebar" aria-label="Закрыть меню" title="Закрыть">✕</button>
         </div>
       </div>
-      ${renderRoutineTasksNav()}
       <div class="levels-block">
         <div class="section-head">
           <div class="section-label">На доске</div>
           <button type="button" class="ghost" data-action="show-all">Все</button>
         </div>
         <div class="level-list">${rows}</div>
-        <input class="add-level" data-role="new-level" placeholder="Новый уровень…" />
+        <div class="add-row">
+          <input class="add-level" data-role="new-level" enterkeyhint="done" placeholder="Новый уровень…" />
+          <button type="button" class="ghost add-row-btn" data-action="add-level" aria-label="Добавить уровень" title="Добавить">＋</button>
+        </div>
       </div>
+      ${renderSearchNav()}
       ${renderHabitNav()}
       ${renderGoalsNav()}
       <div class="horizons-block">
@@ -766,182 +1972,71 @@ function renderSidebar() {
           ).join("")}
         </div>
       </div>
-      <div class="local-note">
-        Записи живут на устройстве. Облако Mail.ru можно включить ниже.
-        <button type="button" class="ghost" style="margin-top:8px; width: 100%; text-align: left" data-action="toggle-cloud-settings">
-          Облако Mail.ru
-        </button>
-        ${renderCloudSettings()}
-        <button type="button" class="ghost" style="margin-top:8px; width: 100%; text-align: left" data-action="toggle-theme-settings">
-          Настройки цвета
-        </button>
-        <div class="theme-settings" data-role="theme-settings" data-open="false">
-          <div class="theme-settings-row">
-            <button
-              type="button"
-              class="${state.theme === "classic" ? "solid" : "ghost"}"
-              data-action="set-theme"
-              data-theme="classic"
-            >
-              Классика
-            </button>
-            <button
-              type="button"
-              class="${state.theme === "dark" ? "solid" : "ghost"}"
-              data-action="set-theme"
-              data-theme="dark"
-            >
-              Тёмная
-            </button>
-            <button
-              type="button"
-              class="${state.theme === "swamp" ? "solid" : "ghost"}"
-              data-action="set-theme"
-              data-theme="swamp"
-            >
-              Болотный
-            </button>
-            <button
-              type="button"
-              class="${state.theme === "turquoise" ? "solid" : "ghost"}"
-              data-action="set-theme"
-              data-theme="turquoise"
-            >
-              Бирюзовый
-            </button>
-            <button
-              type="button"
-              class="${state.theme === "orange" ? "solid" : "ghost"}"
-              data-action="set-theme"
-              data-theme="orange"
-            >
-              Кожаный
-            </button>
-            <button
-              type="button"
-              class="${state.theme === "citrus" ? "solid" : "ghost"}"
-              data-action="set-theme"
-              data-theme="citrus"
-            >
-              Сочный
-            </button>
-            <button
-              type="button"
-              class="${state.theme === "candy" ? "solid" : "ghost"}"
-              data-action="set-theme"
-              data-theme="candy"
-            >
-              Жвачка
-            </button>
-          </div>
-        </div>
-        <div class="file-row" style="margin-top:8px">
-          <button type="button" class="ghost" data-action="export">Экспорт</button>
-          <button type="button" class="ghost" data-action="import">Импорт</button>
-          <input type="file" accept="application/json,.json" data-role="import-file" hidden />
-        </div>
-      </div>
+      ${renderListsNav()}
+      ${renderSettingsNav()}
     </aside>
   `;
 }
 
-function addRoutineTask(name, bucket) {
-  const text = String(name || "").trim();
-  if (!text) return false;
-  if (bucket !== "morning" && bucket !== "day" && bucket !== "evening") return false;
-
-  const existingHabit = state.habits.find((h) => h.name.toLowerCase() === text.toLowerCase());
-  const habit =
-    existingHabit ||
-    ({
-      id: uid(),
-      name: text,
-      cells: {},
-    });
-  if (!existingHabit) state.habits.push(habit);
-
-  const workLevel =
-    state.levels.find((level) => level.id === "level-work" || /^работа$/i.test(level.name)) || state.levels[0];
-
-  state.routineTasks.push({
-    id: uid(),
-    bucket,
-    habitId: habit.id,
-    levelId: workLevel?.id || state.lastLevelId || "",
-    remindAt: defaultRemindAt(bucket),
-  });
-  state.selectedHabitId = habit.id;
-  state.routinesOpen = true;
-  return true;
-}
-
-function renderRoutineTasksNav() {
-  const morning = state.routineTasks.filter((t) => t.bucket === "morning");
-  const day = state.routineTasks.filter((t) => t.bucket === "day");
-  const evening = state.routineTasks.filter((t) => t.bucket === "evening");
-  const open = Boolean(state.routinesOpen);
-  const total = morning.length + day.length + evening.length;
-
-  function row(task) {
-    const habit = state.habits.find((h) => h.id === task.habitId);
-    const name = habit?.name || "Задача";
-    const remindAt = normalizeRemindAt(task.remindAt, task.bucket);
-    return `
-      <div class="routine-row">
-        <span class="routine-name">${escapeHtml(name)}</span>
-        <input
-          class="routine-time"
-          type="text"
-          inputmode="numeric"
-          placeholder="09:00"
-          maxlength="5"
-          data-role="routine-remind"
-          data-id="${task.id}"
-          value="${remindAt}"
-          title="Время напоминания, например 09:00"
-          aria-label="Время напоминания"
-        />
-        <button type="button" class="ghost" data-action="delete-routine-task" data-id="${task.id}">×</button>
-      </div>
-    `;
-  }
-
-  function addRow(bucket, placeholder) {
-    return `<input class="add-level" data-role="new-routine" data-bucket="${bucket}" placeholder="${placeholder}" />`;
-  }
-
+function renderSearchNav() {
   return `
-    <div class="routine-block">
+    <div class="lists-block">
       <button
         type="button"
-        class="routine-toggle${open ? " open" : ""}"
-        data-action="toggle-routines"
-        aria-expanded="${open ? "true" : "false"}"
+        class="routine-toggle${state.view === "search" ? " open" : ""}"
+        data-action="open-search"
       >
-        <span>Ежедневные задачи</span>
-        <span class="routine-toggle-meta">${total ? total : ""}${open ? " ▾" : " ▸"}</span>
+        <span>Поиск</span>
+        <span class="routine-toggle-meta">${state.view === "search" ? "▾" : "▸"}</span>
       </button>
-      <div class="routine-panel" data-open="${open ? "true" : "false"}">
-        <p class="routine-hint">У каждой задачи своё время в формате 09:00.</p>
-        <div class="routine-column">
-          <div class="routine-head">Утро</div>
-          <div class="routine-list">${morning.map(row).join("")}</div>
-          ${addRow("morning", "Новая утренняя задача…")}
-        </div>
-
-        <div class="routine-column">
-          <div class="routine-head">День</div>
-          <div class="routine-list">${day.map(row).join("")}</div>
-          ${addRow("day", "Новая дневная задача…")}
-        </div>
-
-        <div class="routine-column">
-          <div class="routine-head">Вечер</div>
-          <div class="routine-list">${evening.map(row).join("")}</div>
-          ${addRow("evening", "Новая вечерняя задача…")}
-        </div>
-      </div>
     </div>
+  `;
+}
+
+function renderSearchBoard() {
+  const query = String(state.entrySearch || "");
+  const results = searchPlannerEntries(query);
+  const trimmed = query.trim();
+  return `
+    <section class="lists-page search-page">
+      <div class="goals-panel open-always lists-create">
+        <div class="banner-title">Поиск</div>
+        <p class="hint" style="margin:0 0 10px">Ищет по названию, заметкам и пунктам чеклиста во всех записях.</p>
+        <input
+          class="add-level lists-search"
+          data-role="entry-search"
+          type="search"
+          enterkeyhint="search"
+          placeholder="Найти запись…"
+          value="${escapeHtml(query)}"
+          autofocus
+        />
+      </div>
+      ${
+        !trimmed
+          ? `<p class="hint">Начните вводить текст — покажу совпадения.</p>`
+          : !results.length
+            ? `<p class="hint">Ничего не найдено по «${escapeHtml(trimmed)}».</p>`
+            : `<div class="search-results">
+                <p class="hint search-count">${results.length} ${plural(results.length, "запись", "записи", "записей")}</p>
+                ${results
+                  .map((entry) => {
+                    const level = levelById(entry.levelId);
+                    const snippet = String(entry.notes || "")
+                      .trim()
+                      .split("\n")[0]
+                      .slice(0, 120);
+                    return `
+                  <button type="button" class="search-hit${entry.done ? " done" : ""}" data-action="open-search-entry" data-id="${entry.id}">
+                    <span class="search-hit-title">${escapeHtml(entry.title || "Без названия")}</span>
+                    <span class="search-hit-meta">${escapeHtml(horizonLabel(entry.horizon))} · ${escapeHtml(entry.date || "")}${level ? ` · ${escapeHtml(level.name)}` : ""}</span>
+                    ${snippet ? `<span class="search-hit-snippet">${escapeHtml(snippet)}</span>` : ""}
+                  </button>`;
+                  })
+                  .join("")}
+              </div>`
+      }
+    </section>
   `;
 }
 
@@ -1031,37 +2126,148 @@ function renderGoalsBoard() {
   `;
 }
 
-function renderHabitNav() {
-  const year = parseISODate(state.cursor).getFullYear();
-  const size = daysInYear(year);
+function renderListsNav() {
+  const total = (state.lists || []).length;
   return `
-    <div class="habits-block">
-      <div class="section-label">Привычки</div>
-      <div class="habit-list">
-      ${state.habits
-        .map((habit) => {
-          const done = filledHabitCount(habit, year);
-          return `
-            <div class="habit-row${state.selectedHabitId === habit.id ? " active" : ""}">
-              <button type="button" class="habit-name" data-action="select-habit" data-id="${habit.id}">${escapeHtml(habit.name)}</button>
-              <span class="habit-count">${done}/${size}</span>
-              <button type="button" class="ghost" data-action="delete-habit" data-id="${habit.id}">×</button>
-            </div>
-          `;
-        })
-        .join("")}
-      </div>
-      <input class="add-level" data-role="new-habit" placeholder="Новая привычка…" />
+    <div class="lists-block">
+      <button
+        type="button"
+        class="routine-toggle${state.view === "lists" ? " open" : ""}"
+        data-action="open-lists"
+      >
+        <span>Списки</span>
+        <span class="routine-toggle-meta">${total ? total : ""}${state.view === "lists" ? " ▾" : " ▸"}</span>
+      </button>
     </div>
   `;
 }
 
-function renderHabitBoard() {
-  const habit = selectedHabit();
-  if (!habit) {
-    return `<p class="hint">Выберите привычку слева или добавьте новую. Таблица — дни года: в ячейку можно вписать число или букву.</p>`;
-  }
-  const year = parseISODate(state.cursor).getFullYear();
+function renderListsBoard() {
+  const query = String(state.listSearch || "")
+    .trim()
+    .toLowerCase();
+  const lists = (state.lists || []).filter((list) =>
+    query ? list.name.toLowerCase().includes(query) : true,
+  );
+  const expandedId = state.expandedListId || "";
+
+  return `
+    <section class="lists-page">
+      <div class="goals-panel open-always lists-create">
+        <div class="banner-title">Списки</div>
+        <input
+          class="add-level lists-search"
+          data-role="list-search"
+          type="search"
+          placeholder="Поиск по названию…"
+          value="${escapeHtml(state.listSearch || "")}"
+        />
+        <input class="add-level goals-input" data-role="new-list" placeholder="Новый список…" />
+      </div>
+      ${
+        !(state.lists || []).length
+          ? `<p class="hint">Пока списков нет — создайте первый выше.</p>`
+          : !lists.length
+            ? `<p class="hint">Ничего не найдено по «${escapeHtml(state.listSearch || "")}».</p>`
+            : lists
+                .map((list) => {
+                  const doneCount = list.items.filter((item) => item.done).length;
+                  const open = expandedId === list.id;
+                  return `
+        <section class="list-card${open ? " open" : ""}">
+          <button type="button" class="list-card-toggle" data-action="toggle-list-open" data-id="${list.id}">
+            <span class="list-card-name">${escapeHtml(list.name)}</span>
+            <span class="list-card-meta">${doneCount}/${list.items.length}${open ? " ▾" : " ▸"}</span>
+          </button>
+          ${
+            open
+              ? `
+          <div class="list-card-body">
+            <div class="goals-list">
+              ${
+                list.items.length
+                  ? list.items
+                      .map(
+                        (item) => `
+                <div class="goal-row${item.done ? " done" : ""}">
+                  <label class="goal-check" data-action="toggle-list-item" data-list-id="${list.id}" data-id="${item.id}">
+                    <input type="checkbox" ${item.done ? "checked" : ""} tabindex="-1" />
+                    <span>${escapeHtml(item.text)}</span>
+                  </label>
+                  <button type="button" class="ghost" data-action="delete-list-item" data-list-id="${list.id}" data-id="${item.id}">×</button>
+                </div>`,
+                      )
+                      .join("")
+                  : `<div class="empty">Пока пусто — добавьте пункты ниже.</div>`
+              }
+            </div>
+            <input class="add-level goals-input" data-role="new-list-item" data-list-id="${list.id}" placeholder="Новый пункт…" />
+            <div class="list-card-actions">
+              <button type="button" class="ghost" data-action="delete-list" data-id="${list.id}">Удалить список</button>
+            </div>
+          </div>`
+              : ""
+          }
+        </section>`;
+                })
+                .join("")
+      }
+    </section>
+  `;
+}
+
+function renderHabitNav() {
+  const total = (state.habits || []).length;
+  return `
+    <div class="habits-block">
+      <button
+        type="button"
+        class="routine-toggle${state.view === "habit" ? " open" : ""}"
+        data-action="open-habits"
+      >
+        <span>Привычки</span>
+        <span class="routine-toggle-meta">${total ? total : ""}${state.view === "habit" ? " ▾" : " ▸"}</span>
+      </button>
+    </div>
+  `;
+}
+
+function renderHabitStats(habit, year) {
+  const stats = habitStats(habit, year);
+  const maxDone = Math.max(1, ...stats.months.map((item) => item.done));
+  const monthNames = ["я", "ф", "м", "а", "м", "и", "и", "а", "с", "о", "н", "д"];
+  return `
+    <div class="habit-stats">
+      <div class="habit-stats-row">
+        <div class="habit-stat">
+          <span class="habit-stat-value">${stats.monthDone}</span>
+          <span class="habit-stat-label">в месяце</span>
+        </div>
+        <div class="habit-stat">
+          <span class="habit-stat-value">${stats.yearDone}</span>
+          <span class="habit-stat-label">в году</span>
+        </div>
+        <div class="habit-stat">
+          <span class="habit-stat-value">${stats.streak}</span>
+          <span class="habit-stat-label">${plural(stats.streak || 0, "день", "дня", "дней")} подряд</span>
+        </div>
+      </div>
+      <div class="habit-month-bars" aria-label="Отметки по месяцам">
+        ${stats.months
+          .map((item, index) => {
+            const height = Math.max(8, Math.round((item.done / maxDone) * 100));
+            return `<div class="habit-month-bar" title="${item.done} в месяце ${index + 1}">
+              <span class="habit-month-fill" style="height:${height}%"></span>
+              <span class="habit-month-label">${monthNames[index]}</span>
+            </div>`;
+          })
+          .join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderHabitTracker(habit, year) {
   const today = toISODate(new Date());
   const done = filledHabitCount(habit, year);
   const dayHeads = Array.from({ length: 31 }, (_, i) => `<th>${i + 1}</th>`).join("");
@@ -1074,15 +2280,19 @@ function renderHabitBoard() {
       const iso = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
       const raw = habit.cells?.[iso] || "";
       const value = habitMarkDisplay(raw);
-      const cls = [iso === today ? "today" : "", value ? "filled" : "", value === "✓" ? "checked" : ""].filter(Boolean).join(" ");
-      return `<td class="${cls}"><input data-role="habit-cell" data-id="${habit.id}" data-date="${iso}" maxlength="2" value="${escapeHtml(value)}" title="${value === "✓" ? "Сделано" : ""}" /></td>`;
+      const cls = [iso === today ? "today" : "", value ? "filled" : "", value === "✓" ? "checked" : ""]
+        .filter(Boolean)
+        .join(" ");
+      return `<td class="${cls}"><input data-role="habit-cell" data-id="${habit.id}" data-date="${iso}" maxlength="3" value="${escapeHtml(value)}" title="${value === "✓" ? "Сделано" : value ? value : "1–100 или ✓"}" /></td>`;
     }).join("");
     return `<tr><th>${escapeHtml(label)}</th>${cells}</tr>`;
   }).join("");
+
   return `
-    <div class="habit-board">
+    <div class="list-card-body habit-card-body">
+      ${renderHabitStats(habit, year)}
       <div class="habit-board-head">
-        <p class="hint">${done} из ${daysInYear(year)} · в ячейку — число или буква</p>
+        <p class="hint">${done} из ${daysInYear(year)} · в ячейку — число 1–100 или ✓</p>
         <div class="habit-export-actions">
           <button type="button" class="ghost" data-action="export-habit-a4" data-mode="blank">A4 пустой</button>
           <button type="button" class="ghost" data-action="export-habit-a4" data-mode="filled">A4 с отметками</button>
@@ -1094,7 +2304,67 @@ function renderHabitBoard() {
           <tbody>${rows}</tbody>
         </table>
       </div>
+      <div class="list-card-actions">
+        <button type="button" class="ghost" data-action="delete-habit" data-id="${habit.id}">Удалить привычку</button>
+      </div>
     </div>
+  `;
+}
+
+function renderHabitBoard() {
+  const year = parseISODate(state.cursor).getFullYear();
+  const size = daysInYear(year);
+  const habits = state.habits || [];
+  const expandedId = state.selectedHabitId || "";
+  const now = new Date();
+  const monthIndex = now.getFullYear() === year ? now.getMonth() : 11;
+  const monthTotal = habits.reduce((sum, habit) => sum + filledHabitMonthCount(habit, year, monthIndex), 0);
+  const bestStreak = habits.reduce((best, habit) => Math.max(best, habitCurrentStreak(habit)), 0);
+
+  return `
+    <section class="lists-page habits-page">
+      <div class="goals-panel open-always lists-create">
+        <div class="banner-title">Привычки</div>
+        <p class="hint" style="margin:0 0 10px">Каждый день — на экране дня, раз в неделю — на неделе, раз в месяц — в месяце. Можно выбрать корзину и напоминание. Отметка попадает в таблицу.</p>
+        ${
+          habits.length
+            ? `<div class="habit-summary">
+                <span>В этом месяце: <strong>${monthTotal}</strong> ${plural(monthTotal, "отметка", "отметки", "отметок")}</span>
+                <span>Лучшая серия: <strong>${bestStreak}</strong> ${plural(bestStreak || 0, "день", "дня", "дней")}</span>
+              </div>`
+            : ""
+        }
+        <div class="habit-controls">
+          <div class="habit-schedule-row">
+            ${habitScheduleButtons(normalizeSchedule(state.habitScheduleDraft), "set-new-habit-schedule")}
+          </div>
+          <div class="habit-schedule-row">
+            ${habitBucketButtons(normalizeBucket(state.habitBucketDraft), "set-new-habit-bucket")}
+          </div>
+        </div>
+        <input class="add-level goals-input" data-role="new-habit" enterkeyhint="done" placeholder="Новая привычка…" />
+      </div>
+      ${
+        habits.length
+          ? habits
+              .map((habit) => {
+                const done = filledHabitCount(habit, year);
+                const stats = habitStats(habit, year);
+                const open = expandedId === habit.id;
+                return `
+        <section class="list-card${open ? " open" : ""}">
+          <button type="button" class="list-card-toggle" data-action="toggle-habit-open" data-id="${habit.id}">
+            <span class="list-card-name">${escapeHtml(habit.name)}</span>
+            <span class="list-card-meta">${escapeHtml(habitMetaLine(habit))} · ${done}/${size} · серия ${stats.streak}${open ? " ▾" : " ▸"}</span>
+          </button>
+          ${habitControls(habit)}
+          ${open ? renderHabitTracker(habit, year) : ""}
+        </section>`;
+              })
+              .join("")
+          : `<p class="hint">Пока привычек нет — создайте первую выше.</p>`
+      }
+    </section>
   `;
 }
 
@@ -1408,6 +2678,15 @@ function heading() {
     const start = Number(goal.startYear) || date.getFullYear();
     return `${goal.name} · ${start}–${start + Number(goal.years) - 1}`;
   }
+  if (state.view === "lists") {
+    return "Списки";
+  }
+  if (state.view === "search") {
+    return "Поиск";
+  }
+  if (state.view === "settings") {
+    return "Настройки";
+  }
   if (state.view === "span") {
     const { start, end, n } = spanWindow();
     return `${spanLabel(n)} · ${start}–${end}`;
@@ -1426,7 +2705,7 @@ function renderTopBar() {
       </div>
       <div class="topbar-row topbar-row-meta">
         <span class="board-filter">${escapeHtml(filterLabel())}</span>
-        ${state.view === "habit" || state.view === "goals" ? "" : `<button type="button" class="solid" data-action="compose" data-horizon="${state.view === "span" ? "span" : state.view}" data-date="${state.cursor}" data-year="${state.view === "year" || state.view === "span" ? "1" : ""}" data-span="${state.spanYears || ""}">Запись</button>`}
+        ${state.view === "habit" || state.view === "goals" || state.view === "lists" || state.view === "search" || state.view === "settings" ? "" : `<button type="button" class="solid" data-action="compose" data-horizon="${state.view === "span" ? "span" : state.view}" data-date="${state.cursor}" data-year="${state.view === "year" || state.view === "span" ? "1" : ""}" data-span="${state.spanYears || ""}">Запись</button>`}
       </div>
       <div class="topbar-row topbar-row-views">
         <div class="horizon-switch">
@@ -1472,7 +2751,6 @@ function renderWeek() {
       return `
         <section class="day-col${iso === today ? " today" : ""}${weekend ? " weekend" : ""}">
           <div class="day-head"><span>${weekdayLabel(day)}</span><strong>${day.getDate()}</strong></div>
-          ${renderDayRoutinesPanel(iso, { compact: true })}
           <div class="drop-zone" data-action="compose" data-horizon="day" data-date="${iso}">
             ${items.map((entry) => chip(entry, true)).join("")}
             ${items.length ? "" : `<span class="empty">Добавить</span>`}
@@ -1500,14 +2778,26 @@ function renderWeek() {
     })
     .join("");
 
+  const weekHabitDates = days.map((day) => toISODate(day));
   return `
     <section class="week-banner" data-action="compose" data-horizon="week" data-date="${monday}">
       <div class="banner-title">План недели</div>
       ${weekItems.length ? `<div class="chip-row">${weekItems.map((entry) => chip(entry)).join("")}</div>` : `<div class="empty">Нажмите, чтобы задать намерение недели — дом, семья, отпуск</div>`}
     </section>
+    ${renderHabitChecks("Привычки недели", habitsBySchedule("week"), (habit) => ({
+      done: habitMarkedIn(habit, weekHabitDates),
+      scope: "week",
+      anchor: monday,
+      mark: activeIso,
+    }))}
     <div class="week-tabs">${tabs}</div>
     <section class="week-tab-panel day-col${activeIso === today ? " today" : ""}${activeWeekend ? " weekend" : ""}">
-      ${renderDayRoutinesPanel(activeIso)}
+      ${renderHabitChecks("Привычки дня", sortHabitsForDay(habitsBySchedule("day")), (habit) => ({
+        done: habitMarkedOn(habit, activeIso),
+        scope: "day",
+        anchor: activeIso,
+        mark: activeIso,
+      }))}
       <div class="drop-zone" data-action="compose" data-horizon="day" data-date="${activeIso}">
         ${activeItems.map((entry) => chip(entry, true)).join("")}
         ${activeItems.length ? "" : `<span class="empty">Добавить</span>`}
@@ -1536,6 +2826,7 @@ function renderYear() {
       <section class="month-card${month === currentMonth ? " today" : ""}" data-action="compose" data-horizon="year" data-date="${monthDate}">
         <h3>${monthLabel(parseISODate(monthDate))}</h3>
         ${activity ? `<div class="activity">${activity} ${plural(activity, "запись", "записи", "записей")} на неделях и днях</div>` : ""}
+        ${renderMonthHabitChecks(year, month)}
         ${monthItems.map((entry) => chip(entry)).join("")}
         ${monthItems.length ? "" : `<span class="empty">План месяца</span>`}
       </section>
@@ -1667,14 +2958,20 @@ function renderDay() {
   const custom = state.dailies?.[iso];
   const dailyText = custom || generated;
 
+  const showDaily = state.showDaily !== false;
   return `
-    <div class="day-page">
+    <div class="day-page${showDaily ? "" : " no-daily"}">
     <div class="day-layout">
       <section class="day-context">
         <div class="banner-title">Контекст · ${escapeHtml(formatWeekRange(date))}</div>
         ${context.length ? `<div class="chip-row">${context.map((entry) => chip(entry)).join("")}</div>` : `<div class="empty">Сначала можно наметить год или неделю</div>`}
       </section>
-      ${renderDayRoutinesPanel(iso)}
+      ${renderHabitChecks("Привычки", sortHabitsForDay(habitsBySchedule("day")), (habit) => ({
+        done: habitMarkedOn(habit, iso),
+        scope: "day",
+        anchor: iso,
+        mark: iso,
+      }))}
       ${buckets
         .map(([id, title, time]) => {
           const items = dayItems.filter((entry) => timeBucket(entry.startTime) === id);
@@ -1688,14 +2985,18 @@ function renderDay() {
         })
         .join("")}
     </div>
-    <aside class="daily-panel">
+    ${
+      showDaily
+        ? `<aside class="daily-panel">
       <div class="daily-head">
         <div class="banner-title">Дейли</div>
         <button type="button" class="ghost" data-action="reset-daily" data-date="${iso}">Собрать заново</button>
       </div>
       <textarea data-role="daily-text" data-date="${iso}" spellcheck="true">${escapeHtml(dailyText)}</textarea>
-      <p class="daily-hint">Только задачи уровня «Работа». Без ежедневных, дома, семьи и отпуска. «Собрать заново» обновит текст.</p>
-    </aside>
+      <p class="daily-hint">Только задачи уровня «Работа». Без ежедневных, дома, семьи и отпуска. «Собрать заново» обновит текст. Выключается в меню, когда не работаете.</p>
+    </aside>`
+        : ""
+    }
     </div>
   `;
 }
@@ -1782,21 +3083,49 @@ function renderEditor() {
   `;
 }
 
+let lastRenderedView = "";
+
+function captureScroll() {
+  return {
+    canvas: root.querySelector(".canvas")?.scrollTop || 0,
+    theme: root.querySelector(".theme-settings-row")?.scrollTop || 0,
+    sidebar: root.querySelector(".sidebar")?.scrollTop || 0,
+  };
+}
+
+function restoreScroll(saved) {
+  if (!saved) return;
+  const canvas = root.querySelector(".canvas");
+  const theme = root.querySelector(".theme-settings-row");
+  const sidebar = root.querySelector(".sidebar");
+  if (canvas) canvas.scrollTop = saved.canvas;
+  if (theme) theme.scrollTop = saved.theme;
+  if (sidebar) sidebar.scrollTop = saved.sidebar;
+}
+
 function render() {
+  const keepScroll = lastRenderedView === state.view;
+  const savedScroll = keepScroll ? captureScroll() : null;
   const viewHtml =
     state.view === "habit"
       ? renderHabitBoard()
       : state.view === "goals"
         ? renderGoalsBoard()
-        : !visibleLevels().length
-          ? `<p class="hint">На доске ничего не выбрано. Отметьте уровни слева или нажмите «Все».</p>`
-          : state.view === "day"
-            ? renderDay()
-            : state.view === "year"
-              ? renderYear()
-              : state.view === "span"
-                ? renderSpan()
-                : renderWeek();
+        : state.view === "lists"
+          ? renderListsBoard()
+          : state.view === "search"
+            ? renderSearchBoard()
+          : state.view === "settings"
+            ? renderSettingsBoard()
+          : !visibleLevels().length
+            ? `<p class="hint">На доске ничего не выбрано. Отметьте уровни слева или нажмите «Все».</p>`
+            : state.view === "day"
+              ? renderDay()
+              : state.view === "year"
+                ? renderYear()
+                : state.view === "span"
+                  ? renderSpan()
+                  : renderWeek();
   root.innerHTML = `
     <div class="app${state.sidebarOpen ? " sidebar-open" : ""}">
       <div class="sidebar-backdrop" data-action="close-sidebar"></div>
@@ -1807,8 +3136,16 @@ function render() {
       </main>
       ${renderEditor()}
     </div>
+    ${renderFocusTimer()}
   `;
+  lastRenderedView = state.view;
+  applyTheme(displayedTheme());
+  if (savedScroll) {
+    restoreScroll(savedScroll);
+    requestAnimationFrame(() => restoreScroll(savedScroll));
+  }
   persist(state);
+  paintTimerDisplay();
 }
 
 function closeEditor() {
@@ -1906,28 +3243,74 @@ root.addEventListener("click", (event) => {
     return;
   }
 
-  if (action === "delete-routine-task") {
+
+  if (action === "toggle-habit-mark") {
+    event.preventDefault();
     event.stopPropagation();
-    state.routineTasks = state.routineTasks.filter((t) => t.id !== target.dataset.id);
+    const habit = state.habits.find((item) => item.id === target.dataset.id);
+    const anchor = target.dataset.anchor;
+    if (!habit || !anchor) return;
+    if (!habit.cells) habit.cells = {};
+    const scope = target.dataset.scope || "day";
+    let dates = [anchor];
+    if (scope === "week") dates = datesInWeek(anchor);
+    if (scope === "month") {
+      const parsed = parseISODate(anchor);
+      dates = monthDateList(parsed.getFullYear(), parsed.getMonth());
+    }
+    const done = habitMarkedIn(habit, dates);
+    if (done) clearHabitMarks(habit, dates);
+    else habit.cells[target.dataset.mark || anchor] = "✓";
+    render();
+    return;
+  }
+
+  if (action === "set-habit-schedule") {
+    event.preventDefault();
+    event.stopPropagation();
+    const habit = state.habits.find((item) => item.id === target.dataset.id);
+    if (!habit) return;
+    habit.schedule = normalizeSchedule(target.dataset.schedule);
+    render();
+    return;
+  }
+
+  if (action === "set-habit-bucket") {
+    event.preventDefault();
+    event.stopPropagation();
+    const habit = state.habits.find((item) => item.id === target.dataset.id);
+    if (!habit) return;
+    habit.bucket = normalizeBucket(target.dataset.bucket);
+    render();
+    return;
+  }
+
+  if (action === "clear-habit-remind") {
+    event.preventDefault();
+    event.stopPropagation();
+    const habit = state.habits.find((item) => item.id === target.dataset.id);
+    if (!habit) return;
+    habit.remindAt = "";
     render();
     scheduleRemindSync();
     return;
   }
 
-  if (action === "toggle-routine-task") {
+  if (action === "set-new-habit-schedule") {
     event.preventDefault();
-    event.stopPropagation();
-    const task = state.routineTasks.find((t) => t.id === target.dataset.taskId);
-    const date = target.dataset.date;
-    if (!task || !date) return;
-    const habit = state.habits.find((h) => h.id === task.habitId);
-    if (!habit) return;
-    if (!habit.cells) habit.cells = {};
-    const existing = String(habit.cells[date] || "").trim();
-    if (existing) delete habit.cells[date];
-    else habit.cells[date] = "✓";
-    state.selectedHabitId = habit.id;
-    render();
+    state.habitScheduleDraft = normalizeSchedule(target.dataset.schedule);
+    root.querySelectorAll("[data-action=set-new-habit-schedule]").forEach((button) => {
+      button.classList.toggle("active", button.dataset.schedule === state.habitScheduleDraft);
+    });
+    return;
+  }
+
+  if (action === "set-new-habit-bucket") {
+    event.preventDefault();
+    state.habitBucketDraft = normalizeBucket(target.dataset.bucket);
+    root.querySelectorAll("[data-action=set-new-habit-bucket]").forEach((button) => {
+      button.classList.toggle("active", (button.dataset.bucket || "") === state.habitBucketDraft);
+    });
     return;
   }
 
@@ -2053,6 +3436,213 @@ root.addEventListener("click", (event) => {
     return;
   }
 
+  if (action === "select-list") {
+    state.selectedListId = target.dataset.id;
+    state.view = "lists";
+    state.sidebarOpen = false;
+    render();
+    return;
+  }
+
+  if (action === "open-search") {
+    state.view = "search";
+    state.sidebarOpen = false;
+    closeEditor();
+    render();
+    const field = root.querySelector("[data-role=entry-search]");
+    if (field) field.focus();
+    return;
+  }
+
+  if (action === "open-search-entry") {
+    const entry = state.entries.find((item) => item.id === target.dataset.id);
+    if (!entry) return;
+    state.editingId = entry.id;
+    state.composing = null;
+    state.editorDraft = null;
+    if (entry.date) state.cursor = entry.date;
+    initEditorChecklist(entry);
+    render();
+    return;
+  }
+
+  if (action === "open-lists") {
+    state.view = "lists";
+    state.sidebarOpen = false;
+    render();
+    return;
+  }
+
+  if (action === "open-settings") {
+    state.view = "settings";
+    state.sidebarOpen = false;
+    render();
+    scheduleRemindSync();
+    return;
+  }
+
+  if (action === "refresh-today-widget") {
+    state.widgetPushStatus = "Обновляю виджет…";
+    render();
+    pushTodayWidget({ toast: true }).then((result) => {
+      if (!result?.ok && result?.reason === "no-plugin") {
+        state.widgetPushStatus = widgetBridgeHint();
+      } else if (!result?.ok) {
+        state.widgetPushStatus = "Не удалось отправить текст на виджет.";
+      } else if (!result.widgets) {
+        state.widgetPushStatus =
+          "Текст сохранён, но виджета на экране нет — добавь «Сегодня» с рабочего стола.";
+      } else {
+        state.widgetPushStatus = `На виджет ушло (${result.widgets}): обновлён.`;
+      }
+      if (state.view === "settings") render();
+    });
+    return;
+  }
+
+  if (action === "enable-reminders") {
+    state.remindStatus = "Запрашиваю разрешения…";
+    render();
+    syncRoutineReminders({ prompt: true }).then(() => {
+      if (state.view === "settings") render();
+    });
+    return;
+  }
+
+  if (action === "test-reminder") {
+    state.remindStatus = "Ставлю тест на 3 секунды…";
+    render();
+    syncRoutineReminders({ prompt: true, test: true }).then(() => {
+      if (state.view === "settings") render();
+    });
+    return;
+  }
+
+  if (action === "restore-phone-copy") {
+    phoneCopyReady = false;
+    restorePhoneCopy().finally(() => {
+      phoneCopyReady = true;
+      closeEditor();
+      render();
+      scheduleTodayWidget();
+    });
+    return;
+  }
+
+  if (action === "open-habits") {
+    state.view = "habit";
+    state.sidebarOpen = false;
+    render();
+    return;
+  }
+
+  if (action === "timer-start") {
+    startTimerPhase("work", { chime: true });
+    render();
+    return;
+  }
+
+  if (action === "timer-pause") {
+    const timer = ensureTimer();
+    if (timer.phase !== "idle" && timer.endsAt) {
+      timer.pausedMs = Math.max(0, timer.endsAt - Date.now());
+      timer.endsAt = 0;
+      cancelTimerAlarm();
+      render();
+    }
+    return;
+  }
+
+  if (action === "timer-resume") {
+    const timer = ensureTimer();
+    if (timer.phase !== "idle" && timer.pausedMs > 0) {
+      timer.endsAt = Date.now() + timer.pausedMs;
+      timer.pausedMs = 0;
+      scheduleTimerAlarm();
+      render();
+    }
+    return;
+  }
+
+  if (action === "timer-skip") {
+    const timer = ensureTimer();
+    if (timer.phase === "idle") return;
+    advanceTimerPhase();
+    render();
+    return;
+  }
+
+  if (action === "timer-reset") {
+    const timer = ensureTimer();
+    timer.phase = "idle";
+    timer.endsAt = 0;
+    timer.pausedMs = 0;
+    cancelTimerAlarm();
+    render();
+    return;
+  }
+
+  if (action === "timer-toggle-settings") {
+    const timer = ensureTimer();
+    timer.settingsOpen = !timer.settingsOpen;
+    render();
+    return;
+  }
+
+  if (action === "timer-collapse") {
+    const timer = ensureTimer();
+    timer.collapsed = true;
+    timer.settingsOpen = false;
+    render();
+    return;
+  }
+
+  if (action === "timer-expand") {
+    const timer = ensureTimer();
+    timer.collapsed = false;
+    render();
+    return;
+  }
+
+  if (action === "toggle-list-open") {
+    state.expandedListId = state.expandedListId === target.dataset.id ? "" : target.dataset.id;
+    render();
+    return;
+  }
+
+  if (action === "delete-list") {
+    event.stopPropagation();
+    state.lists = (state.lists || []).filter((list) => list.id !== target.dataset.id);
+    if (state.selectedListId === target.dataset.id) {
+      state.selectedListId = state.lists[0]?.id || "";
+    }
+    if (state.expandedListId === target.dataset.id) {
+      state.expandedListId = "";
+    }
+    render();
+    return;
+  }
+
+  if (action === "toggle-list-item") {
+    event.preventDefault();
+    event.stopPropagation();
+    const list =
+      (state.lists || []).find((item) => item.id === target.dataset.listId) || selectedList();
+    const item = list?.items.find((g) => g.id === target.dataset.id);
+    if (item) item.done = !item.done;
+    render();
+    return;
+  }
+
+  if (action === "delete-list-item") {
+    event.stopPropagation();
+    const list =
+      (state.lists || []).find((item) => item.id === target.dataset.listId) || selectedList();
+    if (list) list.items = list.items.filter((g) => g.id !== target.dataset.id);
+    render();
+    return;
+  }
+
   if (action === "shift") {
     shiftCursor(Number(target.dataset.dir));
     render();
@@ -2077,6 +3667,15 @@ root.addEventListener("click", (event) => {
       level.visible = true;
     });
     render();
+    return;
+  }
+
+  if (action === "add-level") {
+    const input = root.querySelector("[data-role=new-level]");
+    if (!input || !addLevel(input.value)) return;
+    render();
+    const next = root.querySelector("[data-role=new-level]");
+    if (next) next.focus();
     return;
   }
 
@@ -2130,27 +3729,53 @@ root.addEventListener("click", (event) => {
     return;
   }
 
+  if (action === "toggle-daily") {
+    const input = target.querySelector("input");
+    state.showDaily = input ? input.checked : state.showDaily === false;
+    render();
+    return;
+  }
+
   if (action === "export") {
+    if (!hasPlus()) {
+      openPlusPanel();
+      return;
+    }
     exportFile();
     return;
   }
 
   if (action === "import") {
+    if (!hasPlus()) {
+      openPlusPanel();
+      return;
+    }
     root.querySelector("[data-role=import-file]").click();
     return;
   }
 
-  if (action === "toggle-theme-settings") {
-    const panel = root.querySelector("[data-role=theme-settings]");
-    if (!panel) return;
-    panel.dataset.open = panel.dataset.open === "true" ? "false" : "true";
+  if (action === "toggle-plus" || action === "open-plus") {
+    openPlusPanel();
     return;
   }
 
-  if (action === "toggle-cloud-settings") {
-    const panel = root.querySelector("[data-role=cloud-settings]");
-    if (!panel) return;
-    panel.dataset.open = panel.dataset.open === "true" ? "false" : "true";
+  if (action === "unlock-plus") {
+    const code = root.querySelector("[data-role=plus-code]")?.value || "";
+    if (!isPlusCode(code)) {
+      const status = root.querySelector("[data-role=plus-status]");
+      if (status) status.textContent = "Код не подошёл";
+      return;
+    }
+    try {
+      localStorage.setItem(PLUS_KEY, "1");
+    } catch {
+      /* ignore */
+    }
+    state.plus = true;
+    applyTheme(displayedTheme());
+    render();
+    window.PulseCloud?.restartAutoSync?.();
+    window.PulseCloud?.syncNow?.();
     return;
   }
 
@@ -2158,10 +3783,10 @@ root.addEventListener("click", (event) => {
     const email = root.querySelector("[data-role=cloud-email]")?.value || "";
     const password = root.querySelector("[data-role=cloud-password]")?.value || "";
     const enabled = Boolean(root.querySelector("[data-role=cloud-enabled]")?.checked);
-    window.PulseCloud?.saveFromForm?.({ email, password, enabled }).then(() => {
+    const autoEvery30 = Boolean(root.querySelector("[data-role=cloud-auto-30]")?.checked);
+    window.PulseCloud?.saveFromForm?.({ email, password, enabled, autoEvery30 }).then(() => {
+      state.view = "settings";
       render();
-      const panel = root.querySelector("[data-role=cloud-settings]");
-      if (panel) panel.dataset.open = "true";
     });
     return;
   }
@@ -2171,36 +3796,17 @@ root.addEventListener("click", (event) => {
     return;
   }
 
-  if (action === "toggle-routines") {
-    state.routinesOpen = !state.routinesOpen;
-    if (state.routinesOpen) {
-      state.view = "day";
-      if (!state.dayRoutinesOpenByDate) state.dayRoutinesOpenByDate = {};
-      state.dayRoutinesOpenByDate[state.cursor] = true;
-      state.sidebarOpen = false;
-    }
-    render();
-    return;
-  }
-
-  if (action === "toggle-day-routines") {
-    event.stopPropagation();
-    const date = target.dataset.date;
-    if (!date) return;
-    if (!state.dayRoutinesOpenByDate) state.dayRoutinesOpenByDate = {};
-    state.dayRoutinesOpenByDate[date] = !state.dayRoutinesOpenByDate[date];
-    render();
-    return;
-  }
-
-  if (action === "voice-routine") {
-    return;
-  }
-
   if (action === "set-theme") {
     const next = target.dataset.theme;
-    if (isThemeId(next)) state.theme = next;
-    applyTheme(state.theme);
+    if (!isThemeId(next)) return;
+    if (!themeIsFree(next) && !hasPlus()) {
+      openPlusPanel();
+      return;
+    }
+    if (state.theme === next) return;
+    state.theme = next;
+    state.updatedAt = Date.now();
+    applyTheme(displayedTheme());
     render();
     return;
   }
@@ -2232,13 +3838,21 @@ root.addEventListener("click", (event) => {
     return;
   }
 
+  if (action === "toggle-habit-open") {
+    state.selectedHabitId = state.selectedHabitId === target.dataset.id ? "" : target.dataset.id;
+    state.view = "habit";
+    render();
+    return;
+  }
+
   if (action === "delete-habit") {
+    event.stopPropagation();
     state.habits = state.habits.filter((habit) => habit.id !== target.dataset.id);
     if (state.selectedHabitId === target.dataset.id) {
-      state.selectedHabitId = state.habits[0]?.id || "";
-      if (!state.selectedHabitId && state.view === "habit") state.view = "week";
+      state.selectedHabitId = "";
     }
     render();
+    return;
   }
 });
 
@@ -2282,24 +3896,32 @@ root.addEventListener("submit", (event) => {
 });
 
 root.addEventListener("keydown", (event) => {
-  if (event.target.dataset.role === "new-level" && event.key === "Enter") {
-    const name = event.target.value.trim();
-    if (!name) return;
-    const used = new Set(state.levels.map((level) => level.color));
-    const color = PALETTE.find((item) => !used.has(item)) || PALETTE[state.levels.length % PALETTE.length];
-    const level = { id: uid(), name, color, visible: true, order: state.levels.length };
-    state.levels.push(level);
-    state.lastLevelId = level.id;
+  if (event.target.dataset.role === "new-level" && isCommitKey(event)) {
+    event.preventDefault();
+    if (!addLevel(event.target.value)) return;
     event.target.value = "";
     render();
+    const next = root.querySelector("[data-role=new-level]");
+    if (next) next.focus();
+    return;
   }
 
-  if (event.target.dataset.role === "new-habit" && event.key === "Enter") {
+  if (event.target.dataset.role === "plus-code" && isCommitKey(event)) {
+    event.preventDefault();
+    root.querySelector("[data-action=unlock-plus]")?.click();
+    return;
+  }
+
+  if (event.target.dataset.role === "new-habit" && isCommitKey(event)) {
+    event.preventDefault();
     const name = event.target.value.trim();
     if (!name) return;
     const habit = {
       id: uid(),
       name,
+      schedule: normalizeSchedule(state.habitScheduleDraft),
+      bucket: normalizeBucket(state.habitBucketDraft),
+      remindAt: "",
       cells: {},
     };
     state.habits.push(habit);
@@ -2307,9 +3929,11 @@ root.addEventListener("keydown", (event) => {
     state.view = "habit";
     event.target.value = "";
     render();
+    scheduleRemindSync();
+    return;
   }
 
-  if (event.target.dataset.role === "new-editor-check" && event.key === "Enter") {
+  if (event.target.dataset.role === "new-editor-check" && isCommitKey(event)) {
     event.preventDefault();
     const text = event.target.value.trim();
     if (!text) return;
@@ -2320,9 +3944,11 @@ root.addEventListener("keydown", (event) => {
     render();
     const next = root.querySelector("[data-role=new-editor-check]");
     if (next) next.focus();
+    return;
   }
 
-  if (event.target.dataset.role === "new-goal-item" && event.key === "Enter") {
+  if (event.target.dataset.role === "new-goal-item" && isCommitKey(event)) {
+    event.preventDefault();
     const text = event.target.value.trim();
     if (!text) return;
     const goal = selectedGoal();
@@ -2332,9 +3958,11 @@ root.addEventListener("keydown", (event) => {
     render();
     const next = root.querySelector("[data-role=new-goal-item]");
     if (next) next.focus();
+    return;
   }
 
-  if (event.target.dataset.role === "new-goal-list" && event.key === "Enter") {
+  if (event.target.dataset.role === "new-goal-list" && isCommitKey(event)) {
+    event.preventDefault();
     const name = event.target.value.trim();
     if (!name) return;
     const years = Math.min(120, Math.max(1, Number(state.goalYearsDraft) || 5));
@@ -2353,16 +3981,45 @@ root.addEventListener("keydown", (event) => {
     render();
     const next = root.querySelector("[data-role=new-goal-item]");
     if (next) next.focus();
+    return;
   }
 
-  if (event.target.dataset.role === "new-routine" && event.key === "Enter") {
-    const name = event.target.value.trim();
-    const bucket = event.target.dataset.bucket;
-    if (!addRoutineTask(name, bucket)) return;
+  if (event.target.dataset.role === "new-list-item" && isCommitKey(event)) {
+    event.preventDefault();
+    const text = event.target.value.trim();
+    if (!text) return;
+    const list =
+      (state.lists || []).find((item) => item.id === event.target.dataset.listId) || selectedList();
+    if (!list) return;
+    list.items.push({ id: uid(), text, done: false });
     event.target.value = "";
     render();
-    scheduleRemindSync();
+    const next = root.querySelector(`[data-role=new-list-item][data-list-id="${list.id}"]`);
+    if (next) next.focus();
+    return;
   }
+
+  if (event.target.dataset.role === "new-list" && isCommitKey(event)) {
+    event.preventDefault();
+    const name = event.target.value.trim();
+    if (!name) return;
+    const list = {
+      id: uid(),
+      name,
+      items: [],
+    };
+    if (!Array.isArray(state.lists)) state.lists = [];
+    state.lists.push(list);
+    state.selectedListId = list.id;
+    state.expandedListId = list.id;
+    state.view = "lists";
+    event.target.value = "";
+    render();
+    const next = root.querySelector(`[data-role=new-list-item][data-list-id="${list.id}"]`);
+    if (next) next.focus();
+    return;
+  }
+
 });
 
 root.addEventListener("input", (event) => {
@@ -2391,29 +4048,77 @@ root.addEventListener("input", (event) => {
     }
     return;
   }
+  if (event.target.dataset.role === "list-search") {
+    state.listSearch = event.target.value;
+    const caret = event.target.selectionStart;
+    render();
+    const next = root.querySelector("[data-role=list-search]");
+    if (next) {
+      next.focus();
+      try {
+        const pos = typeof caret === "number" ? caret : next.value.length;
+        next.setSelectionRange(pos, pos);
+      } catch {
+        /* ignore */
+      }
+    }
+    return;
+  }
+  if (event.target.dataset.role === "entry-search") {
+    state.entrySearch = event.target.value;
+    const caret = event.target.selectionStart;
+    render();
+    const next = root.querySelector("[data-role=entry-search]");
+    if (next) {
+      next.focus();
+      try {
+        const pos = typeof caret === "number" ? caret : next.value.length;
+        next.setSelectionRange(pos, pos);
+      } catch {
+        /* ignore */
+      }
+    }
+    return;
+  }
+  if (event.target.dataset.role === "timer-work" || event.target.dataset.role === "timer-break") {
+    const timer = ensureTimer();
+    const value = Math.min(
+      event.target.dataset.role === "timer-work" ? 180 : 60,
+      Math.max(1, Number(event.target.value) || 1),
+    );
+    if (event.target.dataset.role === "timer-work") timer.workMinutes = value;
+    else timer.breakMinutes = value;
+    event.target.value = String(value);
+    if (timer.phase === "idle") paintTimerDisplay();
+    persist(state);
+    return;
+  }
   if (event.target.dataset.role !== "habit-cell") return;
   const habit = state.habits.find((item) => item.id === event.target.dataset.id);
   if (!habit) return;
   if (!habit.cells) habit.cells = {};
-  const value = event.target.value.trim().slice(0, 2);
+  const value = normalizeHabitCellValue(event.target.value);
   const date = event.target.dataset.date;
   if (value) habit.cells[date] = value;
   else delete habit.cells[date];
+  if (event.target.value !== value) event.target.value = value;
   event.target.parentElement.classList.toggle("filled", Boolean(value));
+  event.target.parentElement.classList.toggle("checked", value === "✓");
   const year = parseISODate(state.cursor).getFullYear();
-  const count = root.querySelector(".habit-row.active .habit-count");
-  if (count) count.textContent = `${filledHabitCount(habit, year)}/${daysInYear(year)}`;
-  const hint = root.querySelector(".habit-board .hint");
-  if (hint) hint.textContent = `${filledHabitCount(habit, year)} из ${daysInYear(year)} · в ячейку — число или буква`;
+  const count = root.querySelector(".list-card.open .list-card-meta");
+  if (count) count.textContent = `${filledHabitCount(habit, year)}/${daysInYear(year)} ▾`;
+  const hint = root.querySelector(".list-card.open .habit-board-head .hint");
+  if (hint) hint.textContent = `${filledHabitCount(habit, year)} из ${daysInYear(year)} · в ячейку — число 1–100 или ✓`;
   persist(state);
 });
 
 root.addEventListener("change", (event) => {
-  if (event.target.dataset.role === "routine-remind") {
-    const task = state.routineTasks.find((item) => item.id === event.target.dataset.id);
-    if (!task) return;
-    task.remindAt = normalizeRemindAt(event.target.value, task.bucket);
-    event.target.value = task.remindAt;
+  if (event.target.dataset.role === "habit-remind") {
+    const habit = state.habits.find((item) => item.id === event.target.dataset.id);
+    if (!habit) return;
+    const raw = String(event.target.value || "").trim();
+    habit.remindAt = raw ? normalizeRemindAt(raw, habitBucket(habit) || "day") : "";
+    event.target.value = habit.remindAt;
     persist(state);
     scheduleRemindSync();
     return;
@@ -2459,6 +4164,8 @@ function handlePulseBack() {
 
 window.__pulseHandleBack = handlePulseBack;
 
+const REMIND_CHANNEL_ID = "pulse-habits-v2";
+
 function notificationIdForTask(taskId) {
   let hash = 0;
   const text = String(taskId || "");
@@ -2470,10 +4177,13 @@ function notificationIdForTask(taskId) {
 }
 
 function getLocalNotifications() {
+  if (!isCapacitorNative()) return null;
   const cap = window.Capacitor;
-  if (!cap || typeof cap.isNativePlatform !== "function" || !cap.isNativePlatform()) return null;
   try {
-    return cap.registerPlugin("LocalNotifications");
+    if (typeof cap.registerPlugin === "function") {
+      return cap.registerPlugin("LocalNotifications");
+    }
+    return cap.Plugins?.LocalNotifications || null;
   } catch {
     return null;
   }
@@ -2481,67 +4191,207 @@ function getLocalNotifications() {
 
 let remindSyncTimer = null;
 let lastWebRemindKey = "";
+let remindStatusBusy = false;
 
-async function syncRoutineReminders() {
-  const tasks = normalizeRoutineTasks(state.routineTasks);
-  state.routineTasks = tasks;
+function habitsWithReminders() {
+  return (state.habits || [])
+    .map((habit) => {
+      const remindAt = habitRemindAt(habit);
+      if (!remindAt) return null;
+      return { habit, remindAt, bucket: habitBucket(habit) };
+    })
+    .filter(Boolean);
+}
 
-  const LocalNotifications = getLocalNotifications();
-  if (LocalNotifications) {
-    try {
-      let perm = await LocalNotifications.checkPermissions();
-      if (perm.display !== "granted") {
-        perm = await LocalNotifications.requestPermissions();
-      }
-      if (perm.display !== "granted") return;
-
-      const pending = await LocalNotifications.getPending();
-      if (pending?.notifications?.length) {
-        await LocalNotifications.cancel({ notifications: pending.notifications });
-      }
-
-      const notifications = tasks
-        .map((task) => {
-          const habit = state.habits.find((h) => h.id === task.habitId);
-          if (!habit) return null;
-          const [hour, minute] = normalizeRemindAt(task.remindAt, task.bucket).split(":").map(Number);
-          const [, bucketLabel] = routineBucketMeta(task.bucket);
-          return {
-            id: notificationIdForTask(task.id),
-            title: "Pulse",
-            body: `${habit.name} · ${bucketLabel}`,
-            schedule: {
-              on: { hour, minute },
-              repeats: true,
-              allowWhileIdle: true,
-            },
-            extra: { taskId: task.id },
-          };
-        })
-        .filter(Boolean);
-
-      if (notifications.length) {
-        await LocalNotifications.schedule({ notifications });
-      }
-    } catch (err) {
-      console.warn("reminders", err);
-    }
-    return;
+function nextRemindDate(remindAt) {
+  const [hour, minute] = String(remindAt || "")
+    .split(":")
+    .map((part) => Number(part));
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  const at = new Date();
+  at.setSeconds(0, 0);
+  at.setHours(hour, minute, 0, 0);
+  if (at.getTime() <= Date.now() + 1500) {
+    at.setDate(at.getDate() + 1);
   }
+  return at;
+}
 
-  if (typeof Notification !== "undefined" && Notification.permission === "default") {
-    try {
-      await Notification.requestPermission();
-    } catch {
-      /* ignore */
-    }
+function setRemindStatus(text) {
+  state.remindStatus = text;
+  if (state.view === "settings" && !remindStatusBusy) {
+    const node = root?.querySelector?.('[data-role="settings-reminders"] .hint');
+    if (node) node.textContent = text;
   }
 }
 
-function scheduleRemindSync() {
+async function ensureReminderPermissions(LocalNotifications, { promptExact = true } = {}) {
+  let perm = await LocalNotifications.checkPermissions();
+  if (perm.display !== "granted") {
+    perm = await LocalNotifications.requestPermissions();
+  }
+  if (perm.display !== "granted") {
+    return { ok: false, reason: "notifications" };
+  }
+
+  let exact = { exact_alarm: "granted" };
+  try {
+    if (typeof LocalNotifications.checkExactNotificationSetting === "function") {
+      exact = await LocalNotifications.checkExactNotificationSetting();
+    }
+  } catch {
+    exact = { exact_alarm: "granted" };
+  }
+
+  if (exact.exact_alarm !== "granted" && promptExact) {
+    try {
+      if (typeof LocalNotifications.changeExactNotificationSetting === "function") {
+        exact = await LocalNotifications.changeExactNotificationSetting();
+      }
+    } catch {
+      /* user may cancel the system screen */
+    }
+  }
+
+  return {
+    ok: true,
+    exact: exact.exact_alarm === "granted",
+  };
+}
+
+async function ensureReminderChannel(LocalNotifications) {
+  try {
+    await LocalNotifications.createChannel({
+      id: REMIND_CHANNEL_ID,
+      name: "Привычки Pulse",
+      description: "Ежедневные напоминания о привычках",
+      importance: 5,
+      visibility: 1,
+      vibration: true,
+      lights: true,
+      lightColor: "#0a4a5c",
+    });
+  } catch {
+    /* channel may already exist */
+  }
+}
+
+function buildHabitNotification({ habit, remindAt, bucket }, idOffset = 0) {
+  const [hour, minute] = remindAt.split(":").map(Number);
+  const bucketLabel = habitBucketLabel(bucket);
+  const body = bucketLabel ? `${habit.name} · ${bucketLabel}` : habit.name;
+  const at = nextRemindDate(remindAt);
+  const base = {
+    id: notificationIdForTask(habit.id) + idOffset,
+    title: "Pulse",
+    body,
+    largeBody: body,
+    channelId: REMIND_CHANNEL_ID,
+    smallIcon: "ic_stat_pulse",
+    iconColor: "#0a4a5c",
+    extra: { habitId: habit.id, remindAt },
+  };
+
+  // Daily cron-like schedule (survives reboot via Capacitor restore).
+  const daily = {
+    ...base,
+    schedule: {
+      on: { hour, minute, second: 0 },
+      allowWhileIdle: true,
+    },
+  };
+
+  // Concrete next fire — more reliable on OEM launchers that delay inexact alarms.
+  if (!at) return [daily];
+  return [
+    daily,
+    {
+      ...base,
+      id: notificationIdForTask(`${habit.id}:next`),
+      schedule: {
+        at: at.toISOString(),
+        allowWhileIdle: true,
+      },
+    },
+  ];
+}
+
+async function syncRoutineReminders({ prompt = false, test = false } = {}) {
+  const LocalNotifications = getLocalNotifications();
+  if (!LocalNotifications) {
+    setRemindStatus("Уведомления работают только в приложении на телефоне.");
+    if (typeof Notification !== "undefined" && Notification.permission === "default") {
+      try {
+        await Notification.requestPermission();
+      } catch {
+        /* ignore */
+      }
+    }
+    return { ok: false, reason: "no-plugin" };
+  }
+
+  try {
+    const access = await ensureReminderPermissions(LocalNotifications, { promptExact: prompt });
+    if (!access.ok) {
+      setRemindStatus("Разреши уведомления для Pulse в настройках телефона.");
+      return { ok: false, reason: access.reason };
+    }
+
+    await ensureReminderChannel(LocalNotifications);
+
+    const pending = await LocalNotifications.getPending();
+    if (pending?.notifications?.length) {
+      await LocalNotifications.cancel({ notifications: pending.notifications });
+    }
+
+    if (test) {
+      const when = new Date(Date.now() + 3000);
+      await LocalNotifications.schedule({
+        notifications: [
+          {
+            id: 42,
+            title: "Pulse",
+            body: "Тест уведомления — если видишь это, напоминания работают",
+            largeBody: "Тест уведомления — если видишь это, напоминания работают",
+            channelId: REMIND_CHANNEL_ID,
+            smallIcon: "ic_stat_pulse",
+            iconColor: "#0a4a5c",
+            schedule: { at: when.toISOString(), allowWhileIdle: true },
+          },
+        ],
+      });
+      setRemindStatus(
+        access.exact
+          ? "Тест через ~3 сек. Точные будильники: да."
+          : "Тест через ~3 сек. Точные будильники выкл. — могут опаздывать.",
+      );
+      return { ok: true, test: true, exact: access.exact };
+    }
+
+    const reminders = habitsWithReminders();
+    const notifications = reminders.flatMap((item) => buildHabitNotification(item));
+    if (notifications.length) {
+      await LocalNotifications.schedule({ notifications });
+    }
+
+    const exactNote = access.exact ? "точные будильники включены" : "точные будильники выкл. — могут опаздывать";
+    setRemindStatus(
+      reminders.length
+        ? `Напоминания запланированы: ${reminders.length}. ${exactNote}.`
+        : `Нет времён у привычек. Добавь ⌚ время — тогда придёт пуш. ${exactNote}.`,
+    );
+    return { ok: true, count: reminders.length, exact: access.exact };
+  } catch (err) {
+    console.warn("reminders", err);
+    setRemindStatus(`Не удалось поставить напоминания: ${err?.message || err}`);
+    return { ok: false, reason: "error", error: err };
+  }
+}
+
+function scheduleRemindSync(options = {}) {
   clearTimeout(remindSyncTimer);
   remindSyncTimer = setTimeout(() => {
-    syncRoutineReminders();
+    syncRoutineReminders(options);
   }, 250);
 }
 
@@ -2552,16 +4402,15 @@ function setupWebReminderTicker() {
     const now = new Date();
     const hhmm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
     const dayKey = toISODate(now);
-    state.routineTasks.forEach((task) => {
-      if (normalizeRemindAt(task.remindAt, task.bucket) !== hhmm) return;
-      const key = `${dayKey}:${task.id}:${hhmm}`;
+    habitsWithReminders().forEach(({ habit, remindAt, bucket }) => {
+      if (remindAt !== hhmm) return;
+      const key = `${dayKey}:${habit.id}:${hhmm}`;
       if (key === lastWebRemindKey || sessionStorage.getItem(`pulse-remind-${key}`)) return;
-      const habit = state.habits.find((h) => h.id === task.habitId);
-      if (!habit) return;
       lastWebRemindKey = key;
       sessionStorage.setItem(`pulse-remind-${key}`, "1");
+      const bucketLabel = habitBucketLabel(bucket);
       try {
-        new Notification("Pulse", { body: `${habit.name} · ${routineBucketMeta(task.bucket)[1]}` });
+        new Notification("Pulse", { body: bucketLabel ? `${habit.name} · ${bucketLabel}` : habit.name });
       } catch {
         /* ignore */
       }
@@ -2569,24 +4418,102 @@ function setupWebReminderTicker() {
   }, 30000);
 }
 
+function setupFocusTimerTicker() {
+  setInterval(() => {
+    const timer = ensureTimer();
+    if (timer.phase === "idle") return;
+    paintTimerDisplay();
+  }, 250);
+}
+
 function setupNativeBack() {
+  if (!isCapacitorNative()) return;
   const cap = window.Capacitor;
-  if (!cap || typeof cap.isNativePlatform !== "function" || !cap.isNativePlatform()) return;
   try {
     const App = cap.registerPlugin("App");
     App.addListener("backButton", () => {
       handlePulseBack();
+    });
+    App.addListener("appStateChange", ({ isActive }) => {
+      if (isActive) {
+        scheduleTodayWidget();
+        scheduleRemindSync();
+        const timer = ensureTimer();
+        if (timer.phase !== "idle" && timer.endsAt) {
+          if (timerRemainingMs(timer) <= 0) {
+            advanceTimerPhase();
+            render();
+          } else {
+            scheduleTimerAlarm();
+          }
+        }
+      }
     });
   } catch (err) {
     console.warn("backButton listener", err);
   }
 }
 
+function setupTimerAlarmListener() {
+  const LocalNotifications = getLocalNotifications();
+  if (!LocalNotifications?.addListener) return;
+  try {
+    LocalNotifications.addListener("localNotificationReceived", (notification) => {
+      const extra = notification?.extra || {};
+      const id = Number(notification?.id);
+      if (extra.kind !== "timer" && id !== TIMER_ALARM_ID) return;
+      // System notification already played the channel sound; only chime if app is open
+      // and phase hasn't advanced yet from the ticker.
+      const timer = ensureTimer();
+      if (timer.phase === "idle") return;
+      if (timer.endsAt && timerRemainingMs(timer) <= 1500) {
+        advanceTimerPhase();
+        render();
+      } else if (extra.chime) {
+        playTimerChime(extra.chime);
+      }
+    });
+    LocalNotifications.addListener("localNotificationActionPerformed", (event) => {
+      const notification = event?.notification || {};
+      const extra = notification?.extra || {};
+      const id = Number(notification?.id);
+      if (extra.kind !== "timer" && id !== TIMER_ALARM_ID) return;
+      const timer = ensureTimer();
+      if (timer.phase !== "idle" && timer.endsAt && timerRemainingMs(timer) <= 1500) {
+        advanceTimerPhase();
+        render();
+      }
+    });
+  } catch (err) {
+    console.warn("timer listener", err);
+  }
+}
+
 setupNativeBack();
+setupTimerAlarmListener();
 setupWebReminderTicker();
+setupFocusTimerTicker();
 scheduleRemindSync();
+scheduleTodayWidget();
+scheduleTimerAlarm();
+
+function openPlusPanel() {
+  const alreadySettings = state.view === "settings";
+  const savedScroll = alreadySettings ? captureScroll() : null;
+  state.view = "settings";
+  state.sidebarOpen = false;
+  render();
+  if (alreadySettings && savedScroll) {
+    restoreScroll(savedScroll);
+    requestAnimationFrame(() => restoreScroll(savedScroll));
+    root.querySelector("#settings-plus .settings-section-title")?.classList.add("plus-nudge");
+    return;
+  }
+  root.querySelector("#settings-plus")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
 
 window.PulseCloud?.init?.({
+  allowSync: () => hasPlus(),
   getSnapshot: () => snapshotPlanner(state),
   getUpdatedAt: () => Number(state.updatedAt) || 0,
   applySnapshot: (parsed) => {
@@ -2603,7 +4530,30 @@ window.PulseCloud?.init?.({
   },
 });
 
-render();
+window.addEventListener("storage", (event) => {
+  if (event.key !== STORAGE_KEY || !event.newValue) return;
+  try {
+    const parsed = JSON.parse(event.newValue);
+    const remoteAt = Number(parsed.updatedAt) || 0;
+    const localAt = Number(state.updatedAt) || 0;
+    if (remoteAt < localAt) return;
+    const nextTheme = isThemeId(parsed.theme) ? parsed.theme : state.theme;
+    if (nextTheme === state.theme && remoteAt === localAt) return;
+    state.theme = nextTheme;
+    state.updatedAt = remoteAt || localAt;
+    applyTheme(displayedTheme());
+    if (state.view === "settings") render();
+  } catch {
+    /* ignore broken peer writes */
+  }
+});
+
+restorePhoneCopy().finally(() => {
+  phoneCopyReady = true;
+  render();
+  scheduleTodayWidget();
+  scheduleRemindSync();
+});
 
 if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) {
   navigator.serviceWorker.getRegistrations().then((registrations) => {

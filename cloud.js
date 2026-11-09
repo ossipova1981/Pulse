@@ -6,7 +6,7 @@
   /** Fallback if /Pulse cannot be created (Android has no MKCOL). */
   const ROOT_FILE_PATH = "/planer.json";
   const PUSH_DELAY_MS = 2500;
-  const PULL_EVERY_MS = 60 * 1000;
+  const AUTO_SYNC_MS = 30 * 60 * 1000;
   let activeFilePath = FILE_PATH;
 
   let hooks = {
@@ -15,6 +15,7 @@
     applySnapshot: () => {},
   };
   let pushTimer = 0;
+  let pullTimer = 0;
   let syncing = false;
   let queued = false;
   let statusText = "";
@@ -24,13 +25,14 @@
       const parsed = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
       return {
         enabled: Boolean(parsed.enabled),
+        autoEvery30: Boolean(parsed.autoEvery30),
         email: String(parsed.email || "").trim(),
         password: String(parsed.password || ""),
         lastSyncAt: Number(parsed.lastSyncAt) || 0,
         lastError: String(parsed.lastError || ""),
       };
     } catch {
-      return { enabled: false, email: "", password: "", lastSyncAt: 0, lastError: "" };
+      return { enabled: false, autoEvery30: false, email: "", password: "", lastSyncAt: 0, lastError: "" };
     }
   }
 
@@ -41,6 +43,7 @@
       SETTINGS_KEY,
       JSON.stringify({
         enabled: Boolean(next.enabled),
+        autoEvery30: Boolean(next.autoEvery30),
         email: String(next.email || "").trim(),
         password: String(next.password || ""),
         lastSyncAt: Number(next.lastSyncAt) || 0,
@@ -60,9 +63,10 @@
     if (meta.lastError) return meta.lastError;
     if (meta.lastSyncAt) {
       const at = new Date(meta.lastSyncAt);
-      return `Синхронизировано ${at.toLocaleString("ru-RU", { hour: "2-digit", minute: "2-digit", day: "numeric", month: "short" })}`;
+      const when = `Синхронизировано ${at.toLocaleString("ru-RU", { hour: "2-digit", minute: "2-digit", day: "numeric", month: "short" })}`;
+      return meta.autoEvery30 ? `${when} · каждые 30 мин` : when;
     }
-    return "Ожидает первую синхронизацию";
+    return meta.autoEvery30 ? "Ожидает первую синхронизацию · каждые 30 мин" : "Ожидает первую синхронизацию";
   }
 
   function paintStatus(text) {
@@ -207,14 +211,19 @@
       (Array.isArray(data.entries) ? data.entries.length : 0) * 10 +
       (Array.isArray(data.habits) ? data.habits.length : 0) * 5 +
       (Array.isArray(data.goals) ? data.goals.length : 0) * 5 +
+      (Array.isArray(data.lists) ? data.lists.length : 0) * 5 +
       (Array.isArray(data.routineTasks) ? data.routineTasks.length : 0) * 2 +
       Object.keys(data.dailies && typeof data.dailies === "object" ? data.dailies : {}).length
     );
   }
 
+  function syncAllowed() {
+    return typeof hooks.allowSync !== "function" || hooks.allowSync();
+  }
+
   async function runSync() {
     const meta = loadMeta();
-    if (!meta.enabled) return;
+    if (!meta.enabled || !syncAllowed()) return;
     if (!isNativeApp()) {
       const text = explainError(new Error("cors"));
       saveMeta({ lastError: text });
@@ -275,11 +284,21 @@
 
   function schedulePush() {
     const meta = loadMeta();
-    if (!meta.enabled) return;
+    if (!meta.enabled || !syncAllowed()) return;
     clearTimeout(pushTimer);
     pushTimer = setTimeout(() => {
       syncNow();
     }, PUSH_DELAY_MS);
+  }
+
+  function restartAutoSync() {
+    clearInterval(pullTimer);
+    pullTimer = 0;
+    const meta = loadMeta();
+    if (!syncAllowed() || !meta.enabled || !meta.autoEvery30) return;
+    pullTimer = setInterval(() => {
+      if (document.visibilityState === "visible") syncNow();
+    }, AUTO_SYNC_MS);
   }
 
   function init(nextHooks) {
@@ -287,17 +306,22 @@
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") syncNow();
     });
-    setInterval(() => {
-      if (document.visibilityState === "visible") syncNow();
-    }, PULL_EVERY_MS);
+    restartAutoSync();
     setTimeout(() => syncNow(), 800);
   }
 
-  async function saveFromForm({ email, password, enabled }) {
-    saveMeta({ email, enabled: Boolean(enabled), lastError: "" });
+  async function saveFromForm({ email, password, enabled, autoEvery30 }) {
+    const turnOn = Boolean(enabled) && syncAllowed();
+    saveMeta({
+      email,
+      enabled: turnOn,
+      autoEvery30: Boolean(autoEvery30),
+      lastError: "",
+    });
     if (password) await writePassword(password);
-    paintStatus(enabled ? "Подключаю Облако…" : "Выключена");
-    if (enabled) await syncNow();
+    restartAutoSync();
+    paintStatus(turnOn ? "Подключаю Облако…" : "Выключена");
+    if (turnOn) await syncNow();
     else paintStatus("Выключена");
   }
 
@@ -309,5 +333,6 @@
     formatStatus,
     isNativeApp,
     saveFromForm,
+    restartAutoSync,
   };
 })(window);

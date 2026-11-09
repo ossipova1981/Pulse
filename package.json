@@ -1,7 +1,7 @@
 {
   "name": "planer",
   "productName": "Pulse",
-  "version": "0.4.8",
+  "version": "0.4.76",
   "private": true,
   "main": "electron/main.cjs",
   "scripts": {
@@ -37,7 +37,13 @@
       "manifest.webmanifest",
       "sw.js",
       "icons/**/*",
-      "electron/**/*"
+      "sounds/**/*",
+      "electron/**/*",
+      "!**/android/**",
+      "!**/ios/**",
+      "!**/*.apk",
+      "!**/*.aab",
+      "!**/build/**"
     ],
     "mac": {
       "category": "public.app-category.productivity",
@@ -47,10 +53,10 @@
       ]
     },
     "win": {
-      "icon": "icons/icon-source.png",
+      "icon": "icons/desktop.ico",
+      "signAndEditExecutable": false,
       "target": [
-        "zip",
-        "portable"
+        "zip"
       ]
     },
     "linux": {

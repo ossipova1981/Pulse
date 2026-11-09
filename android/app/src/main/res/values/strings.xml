@@ -4,4 +4,8 @@
     <string name="title_activity_main">Pulse</string>
     <string name="package_name">local.planer.app</string>
     <string name="custom_url_scheme">local.planer.app</string>
+    <string name="widget_today_title">Сегодня</string>
+    <string name="widget_today_subtitle_default">Pulse</string>
+    <string name="widget_today_empty">Пока пусто — открой Pulse</string>
+    <string name="widget_today_description">Привычки и дела на сегодня</string>
 </resources>
